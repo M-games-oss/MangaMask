@@ -307,17 +307,19 @@ class EditorController extends ChangeNotifier {
           final tx = x + ox;
           if (tx < 0 || tx >= w) continue;
           final src = layer.pixels.getPixel(x, y);
-          final a = (src.a * layer.opacity).round().clamp(0, 255);
+          final srcR = src.r.toInt(), srcG = src.g.toInt(), srcB = src.b.toInt(), srcA = src.a.toInt();
+          final a = ((srcA * layer.opacity).round().clamp(0, 255)).toInt();
           if (a == 0) continue;
           if (a == 255) {
-            out.setPixelRgba(tx, ty, src.r, src.g, src.b, 255);
+            out.setPixelRgba(tx, ty, srcR, srcG, srcB, 255);
           } else {
             final dst = out.getPixel(tx, ty);
-            final outA = a + dst.a * (255 - a) ~/ 255;
-            final blend = (int s, int d) =>
-                outA == 0 ? 0 : ((s * a + d * dst.a * (255 - a) ~/ 255) ~/ outA);
+            final dstR = dst.r.toInt(), dstG = dst.g.toInt(), dstB = dst.b.toInt(), dstA = dst.a.toInt();
+            final outA = ((a + dstA * (255 - a) ~/ 255).clamp(0, 255)).toInt();
+            int blend(int s, int d) =>
+                outA == 0 ? 0 : ((s * a + d * dstA * (255 - a) ~/ 255) ~/ outA);
             out.setPixelRgba(
-              tx, ty, blend(src.r, dst.r), blend(src.g, dst.g), blend(src.b, dst.b), outA);
+              tx, ty, blend(srcR, dstR), blend(srcG, dstG), blend(srcB, dstB), outA);
           }
         }
       }
