@@ -86,8 +86,8 @@ class _LayerCanvasState extends State<LayerCanvas> {
     final active = controller.activeLayer;
     if (active == null) return;
     final pt = _toImageSpace(details.localPosition, displayW, displayH, active.width, active.height);
-    final x = pt.dx.round().clamp(0, active.width - 1);
-    final y = pt.dy.round().clamp(0, active.height - 1);
+    final x = pt.dx.round().clamp(0, active.width - 1).toInt();
+    final y = pt.dy.round().clamp(0, active.height - 1).toInt();
 
     if (controller.tool == ToolType.smartSelect) {
       final name = await _promptPartName(context);
@@ -195,8 +195,8 @@ class _LayerCanvasState extends State<LayerCanvas> {
       minY = min(minY, p.dy.round());
       maxY = max(maxY, p.dy.round());
     }
-    minY = minY.clamp(0, h - 1);
-    maxY = maxY.clamp(0, h - 1);
+    minY = minY.clamp(0, h - 1).toInt();
+    maxY = maxY.clamp(0, h - 1).toInt();
 
     for (var y = minY; y <= maxY; y++) {
       final xs = <double>[];
@@ -210,8 +210,8 @@ class _LayerCanvasState extends State<LayerCanvas> {
       }
       xs.sort();
       for (var i = 0; i + 1 < xs.length; i += 2) {
-        final x0 = xs[i].round().clamp(0, w - 1);
-        final x1 = xs[i + 1].round().clamp(0, w - 1);
+        final x0 = xs[i].round().clamp(0, w - 1).toInt();
+        final x1 = xs[i + 1].round().clamp(0, w - 1).toInt();
         for (var x = x0; x <= x1; x++) {
           mask[y * w + x] = 255;
         }
