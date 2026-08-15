@@ -25,12 +25,27 @@ workflows:
 
       - name: Build iOS (no code signing)
         script: |
-          flutter build ios --release --no-codesign
+          # flutter build ios --no-codesign still triggers Xcode's team
+          # validation on modern Xcode, so we let Flutter only generate the
+          # Xcode project config, then drive xcodebuild ourselves with
+          # signing explicitly and unambiguously disabled.
+          flutter build ios --release --no-codesign --config-only
+          cd ios
+          xcodebuild build \
+            -workspace Runner.xcworkspace \
+            -scheme Runner \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath ../build/ios_build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            PROVISIONING_PROFILE_SPECIFIER=""
 
       - name: Package unsigned .ipa
         script: |
           mkdir -p build/ios/ipa/Payload
-          cp -r build/ios/iphoneos/Runner.app build/ios/ipa/Payload/
+          cp -r build/ios_build/Build/Products/Release-iphoneos/Runner.app build/ios/ipa/Payload/
           cd build/ios/ipa
           zip -r manga_cutter_unsigned.ipa Payload
     artifacts:
