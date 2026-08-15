@@ -1,0 +1,94 @@
+workflows:
+  # ---------------------------------------------------------------------
+  # WORKFLOW 1: Unsigned IPA
+  # No Apple Developer Program needed. You sign it yourself afterward with
+  # Sideloadly or AltStore/SideStore using any free Apple ID.
+  # Cert from a free Apple ID expires after 7 days -> re-sign/reinstall
+  # weekly with the same tool (a couple clicks, doesn't need Codemagic).
+  # ---------------------------------------------------------------------
+  ios-unsigned-sideload:
+    name: iOS Unsigned IPA (Sideloadly / AltStore)
+    max_build_duration: 60
+    instance_type: mac_mini_m2
+    environment:
+      flutter: stable
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Get Flutter packages
+        script: flutter pub get
+
+      - name: Install CocoaPods
+        script: |
+          cd ios
+          pod install
+
+      - name: Build iOS (no code signing)
+        script: |
+          flutter build ios --release --no-codesign
+
+      - name: Package unsigned .ipa
+        script: |
+          mkdir -p build/ios/ipa/Payload
+          cp -r build/ios/iphoneos/Runner.app build/ios/ipa/Payload/
+          cd build/ios/ipa
+          zip -r manga_cutter_unsigned.ipa Payload
+    artifacts:
+      - build/ios/ipa/*.ipa
+    publishing:
+      email:
+        recipients:
+          - YOUR_EMAIL_HERE@example.com
+        notify:
+          success: true
+          failure: true
+
+  # ---------------------------------------------------------------------
+  # WORKFLOW 2 (optional): Ad-hoc signed IPA
+  # Needs a paid Apple Developer Program account ($99/yr) connected to
+  # Codemagic (Team settings -> Code signing identities -> Apple Developer
+  # Portal integration), plus your test devices' UDIDs registered there.
+  # Codemagic then auto-generates the certificate + ad-hoc provisioning
+  # profile and gives you a signed .ipa that installs straight from an
+  # OTA link, no third-party resigning tool needed. Cert lasts a year.
+  # Uncomment and fill in APP_STORE_CONNECT / signing values to use it.
+  # ---------------------------------------------------------------------
+  # ios-adhoc-signed:
+  #   name: iOS Ad-hoc Signed IPA
+  #   max_build_duration: 60
+  #   instance_type: mac_mini_m2
+  #   environment:
+  #     flutter: stable
+  #     xcode: latest
+  #     cocoapods: default
+  #     ios_signing:
+  #       distribution_type: ad_hoc
+  #       bundle_identifier: com.yourname.mangacutter
+  #     vars:
+  #       APP_STORE_CONNECT_ISSUER_ID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+  #       APP_STORE_CONNECT_KEY_IDENTIFIER: XXXXXXXXXX
+  #       APP_STORE_CONNECT_PRIVATE_KEY: Encrypted(...)
+  #   scripts:
+  #     - name: Get Flutter packages
+  #       script: flutter pub get
+  #     - name: Install CocoaPods
+  #       script: |
+  #         cd ios
+  #         pod install
+  #     - name: Set up code signing
+  #       script: |
+  #         keychain initialize
+  #         app-store-connect fetch-signing-files "$BUNDLE_ID" \
+  #           --type IOS_APP_ADHOC --create
+  #         keychain add-certificates
+  #         xcode-project use-profiles
+  #     - name: Build signed IPA
+  #       script: |
+  #         flutter build ipa --release \
+  #           --export-options-plist=/Users/builder/export_options.plist
+  #   artifacts:
+  #     - build/ios/ipa/*.ipa
+  #   publishing:
+  #     email:
+  #       recipients:
+  #         - YOUR_EMAIL_HERE@example.com

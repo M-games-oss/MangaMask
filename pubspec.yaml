@@ -1,0 +1,28 @@
+name: manga_cutter
+description: AI-assisted manga character/panel cutting and layer editor for iOS.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.6
+  image: ^4.1.7            # pixel-level PNG editing (flood fill, brushes, connected components)
+  file_picker: ^8.0.0
+  image_picker: ^1.1.2
+  http: ^1.2.1
+  path_provider: ^2.1.3
+  provider: ^6.1.2
+  share_plus: ^9.0.0
+  permission_handler: ^11.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
