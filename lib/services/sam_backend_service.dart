@@ -3,13 +3,35 @@ import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 import 'package:image/image.dart' as img;
 
+/// One include/exclude point to send to the backend, e.g. sampled along a
+/// brush stroke. [positive] true = "this is part of the thing I want",
+/// false = "this is NOT part of it" (used to correct SAM when it bleeds
+/// into an overlapping limb/torso/background).
+class SamPointPrompt {
+  SamPointPrompt(this.x, this.y, this.positive);
+  final int x;
+  final int y;
+  final bool positive;
+
+  Map<String, dynamic> toJson() => {
+        'x': x,
+        'y': y,
+        'label': positive ? 1 : 0,
+      };
+}
+
+/// One of SAM's mask proposals. The backend returns up to 3 of these
+/// (best-scoring first) instead of silently picking one — flat manga
+/// backgrounds regularly cause the "highest confidence" mask to be the
+/// whole background or whole figure, so the caller needs a real
+/// alternative to fall back to instead of a single bad guess.
+class SamMaskCandidate {
+  SamMaskCandidate({required this.mask, required this.score});
+  final Uint8List mask;
+  final double score;
+}
+
 /// Talks to the FastAPI backend in /backend (Segment Anything / MobileSAM).
-/// This is what gives real "tap the iris and only the iris gets selected"
-/// behavior, because SAM is class-agnostic: it segments whatever object or
-/// sub-part contains the point you clicked, at whatever granularity that
-/// region naturally has - which is a far better fit for manga anatomy than
-/// a fixed list of body-part classes would be.
-///
 /// Configure [baseUrl] to point at your deployed backend (see backend/README).
 class SamBackendService {
   SamBackendService({required this.baseUrl});
@@ -27,41 +49,23 @@ class SamBackendService {
     }
   }
 
-  /// Point-prompt segmentation. Returns a 0/255 mask the same size as the
-  /// input image, or null on failure (caller should fall back to
-  /// FloodFillService.selectContiguous so the app still works offline).
-  Future<Uint8List?> segmentAtPoint({
+  /// Single-point prompt. Kept for callers that only have one point; prefer
+  /// [segmentAtPoints] when you can supply more context (it's what the SAM
+  /// brush tool uses).
+  Future<List<SamMaskCandidate>?> segmentAtPoint({
     required img.Image image,
     required int x,
     required int y,
     bool positive = true,
-  }) async {
-    try {
-      final pngBytes = img.encodePng(image);
-      final resp = await http
-          .post(
-            Uri.parse('$baseUrl/segment_point'),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'image_png_base64': base64Encode(pngBytes),
-              'x': x,
-              'y': y,
-              'label': positive ? 1 : 0,
-            }),
-          )
-          .timeout(const Duration(seconds: 20));
-      if (resp.statusCode != 200) return null;
-      final body = jsonDecode(resp.body) as Map<String, dynamic>;
-      final maskB64 = body['mask_png_base64'] as String;
-      final maskImg = img.decodePng(base64Decode(maskB64))!;
-      return _grayscaleToMask(maskImg);
-    } catch (_) {
-      return null;
-    }
+  }) {
+    return segmentAtPoints(
+      image: image,
+      points: [SamPointPrompt(x, y, positive)],
+    );
   }
 
   /// Box-prompt segmentation (drag a rectangle around e.g. a whole arm).
-  Future<Uint8List?> segmentInBox({
+  Future<List<SamMaskCandidate>?> segmentInBox({
     required img.Image image,
     required int x0,
     required int y0,
@@ -80,14 +84,54 @@ class SamBackendService {
             }),
           )
           .timeout(const Duration(seconds: 20));
-      if (resp.statusCode != 200) return null;
-      final body = jsonDecode(resp.body) as Map<String, dynamic>;
-      final maskB64 = body['mask_png_base64'] as String;
-      final maskImg = img.decodePng(base64Decode(maskB64))!;
-      return _grayscaleToMask(maskImg);
+      return _parseCandidates(resp);
     } catch (_) {
       return null;
     }
+  }
+
+  /// Multi-point prompt: a mix of include/exclude points, typically sampled
+  /// along a brush stroke (and an "exclude" stroke drawn over whatever SAM
+  /// keeps bleeding into, like an overlapping arm). This is what lets the
+  /// user correct a bad guess instead of getting one shot from a single tap.
+  Future<List<SamMaskCandidate>?> segmentAtPoints({
+    required img.Image image,
+    required List<SamPointPrompt> points,
+  }) async {
+    if (points.isEmpty) return null;
+    try {
+      final pngBytes = img.encodePng(image);
+      final resp = await http
+          .post(
+            Uri.parse('$baseUrl/segment_points'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'image_png_base64': base64Encode(pngBytes),
+              'points': points.map((p) => p.toJson()).toList(),
+            }),
+          )
+          .timeout(const Duration(seconds: 20));
+      return _parseCandidates(resp);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  List<SamMaskCandidate>? _parseCandidates(http.Response resp) {
+    if (resp.statusCode != 200) return null;
+    final body = jsonDecode(resp.body) as Map<String, dynamic>;
+    final rawCandidates = body['candidates'] as List<dynamic>?;
+    if (rawCandidates == null || rawCandidates.isEmpty) return null;
+
+    final out = <SamMaskCandidate>[];
+    for (final c in rawCandidates) {
+      final maskB64 = c['mask_png_base64'] as String;
+      final score = (c['score'] as num).toDouble();
+      final maskImg = img.decodePng(base64Decode(maskB64));
+      if (maskImg == null) continue;
+      out.add(SamMaskCandidate(mask: _grayscaleToMask(maskImg), score: score));
+    }
+    return out.isEmpty ? null : out;
   }
 
   Uint8List _grayscaleToMask(img.Image maskImg) {

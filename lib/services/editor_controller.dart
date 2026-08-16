@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
@@ -17,6 +18,14 @@ import 'inpainting_backend_service.dart';
 ///   processing - stroke just ended, waiting on the inpaint backend
 ///   reviewing  - backend responded, showing Apply/Cancel to the user
 enum RemovalPreviewPhase { none, processing, reviewing }
+
+/// Tracks the SAM brush select lifecycle:
+///   none       - nothing selected, no points collected
+///   collecting - user is actively brushing include/exclude points
+///   processing - stroke paused/ended, waiting on the debounced backend call
+///   reviewing  - backend responded with candidate mask(s); user can pick a
+///                candidate, add more strokes to refine, cancel, or apply
+enum SamSelectPhase { none, collecting, processing, reviewing }
 
 class EditorController extends ChangeNotifier {
   EditorController();
@@ -50,12 +59,16 @@ class EditorController extends ChangeNotifier {
   void loadBaseImage(img.Image image) {
     layers.clear();
     history.clear();
+    _clearSamSelection();
     layers.add(ManagedLayer(id: _newId(), name: 'Base Artwork', pixels: image));
     activeLayerIndex = 0;
     notifyListeners();
   }
 
   void setTool(ToolType t) {
+    // Switching tools mid-selection would otherwise leave a dangling debounce
+    // timer / stale points around from whatever the SAM brush was doing.
+    if (t != ToolType.aiClickSelect) _clearSamSelection();
     tool = t;
     notifyListeners();
   }
@@ -127,36 +140,6 @@ class EditorController extends ChangeNotifier {
     _cutMaskToNewLayer(mask, partName);
   }
 
-  /// Same idea but the mask comes from the SAM backend, which understands
-  /// object/part boundaries rather than only flat color regions - so it
-  /// handles things like "the whole arm" even when it's drawn with shading
-  /// bands of several different colors.
-  Future<bool> aiSelectAndCut(int x, int y, {required String partName}) async {
-    final active = activeLayer;
-    if (active == null || active.locked) return false;
-    // Same guard as smartSelectAndCut — skip the network call entirely if
-    // the tapped pixel is already a punched-out hole.
-    if (active.pixels.getPixel(x, y).a == 0) return false;
-
-    final mask = await _sam.segmentAtPoint(image: active.pixels, x: x, y: y);
-    if (mask == null) return false;
-    _cutMaskToNewLayer(mask, partName);
-    return true;
-  }
-
-  Future<bool> aiSelectBoxAndCut(
-    int x0, int y0, int x1, int y1, {required String partName}) async {
-    final active = activeLayer;
-    if (active == null || active.locked) return false;
-    if (active.pixels.getPixel(x0, y0).a == 0) return false;
-
-    final mask = await _sam.segmentInBox(
-      image: active.pixels, x0: x0, y0: y0, x1: x1, y1: y1);
-    if (mask == null) return false;
-    _cutMaskToNewLayer(mask, partName);
-    return true;
-  }
-
   /// Cuts an arbitrary manual mask (from polygon/magnetic lasso) into a new
   /// layer, same code path as the AI selections.
   void manualMaskAndCut(Uint8List mask, String partName) {
@@ -190,6 +173,159 @@ class EditorController extends ChangeNotifier {
     notifyListeners();
   }
 
+  // ---------------- SAM brush select (tap-and-drag, debounced, reviewed) --
+  //
+  // Replaces the old "tap once, take SAM's top-scoring mask, cut it
+  // immediately" flow. That flow had two real problems: (1) a single point
+  // is often not enough information for SAM to separate two touching,
+  // similarly-shaded regions (an arm resting over a torso), and (2) taking
+  // the single highest-scoring mask with no review step meant a bad guess
+  // (sometimes "the whole background") went straight into a destructive
+  // cut. This flow instead: collects include/exclude points as the user
+  // brushes, waits for a pause (debounced — no live per-frame backend
+  // calls), shows the resulting candidate mask(s) for review, lets the user
+  // brush more to refine, and only cuts when they explicitly apply.
+
+  static const Duration samDebounce = Duration(milliseconds: 400);
+  static const double _samSampleSpacingPx = 10; // min image-px between sampled points
+
+  /// Whether the next brush stroke adds include or exclude points. Flipped
+  /// by a toolbar toggle. Exclude points are how you tell SAM "not this
+  /// part" — e.g. brush the overlapping arm as exclude after SAM includes
+  /// it with the torso.
+  bool samBrushExclude = false;
+
+  SamSelectPhase samSelectPhase = SamSelectPhase.none;
+  final List<SamPointPrompt> _samPoints = [];
+  List<Offset> _samStrokePreviewPoints = []; // image-space, for drawing dots while collecting
+  List<Offset> get samStrokePreviewPoints => _samStrokePreviewPoints;
+
+  List<SamMaskCandidate>? _samCandidates;
+  int _samCandidateIndex = 0;
+  Timer? _samDebounceTimer;
+  Offset? _lastSamSamplePoint;
+
+  List<SamMaskCandidate>? get samCandidates => _samCandidates;
+  int get samCandidateIndex => _samCandidateIndex;
+  Uint8List? get pendingSamMask =>
+      _samCandidates == null ? null : _samCandidates![_samCandidateIndex].mask;
+
+  void beginSamBrushStroke() {
+    final active = activeLayer;
+    if (active == null || active.locked) return;
+    _samDebounceTimer?.cancel();
+    // Starting a fresh stroke while `reviewing` a previous result means the
+    // user is refining it — keep the accumulated points and candidates.
+    // Starting one from `none` means a brand new selection.
+    if (samSelectPhase == SamSelectPhase.none) {
+      _samPoints.clear();
+      _samCandidates = null;
+      _samStrokePreviewPoints = [];
+    }
+    _lastSamSamplePoint = null;
+    samSelectPhase = SamSelectPhase.collecting;
+  }
+
+  /// Call with an image-space point while the user drags. Points are
+  /// spatially throttled (not every pointer-move event) so a slow stroke
+  /// doesn't spam hundreds of near-duplicate points into the prompt.
+  void addSamBrushPoint(Offset imagePoint) {
+    if (samSelectPhase != SamSelectPhase.collecting) return;
+    if (_lastSamSamplePoint != null &&
+        (imagePoint - _lastSamSamplePoint!).distance < _samSampleSpacingPx) {
+      return;
+    }
+    _lastSamSamplePoint = imagePoint;
+    _samPoints.add(SamPointPrompt(
+      imagePoint.dx.round(),
+      imagePoint.dy.round(),
+      !samBrushExclude,
+    ));
+    _samStrokePreviewPoints = [..._samStrokePreviewPoints, imagePoint];
+    notifyListeners();
+  }
+
+  /// Call when the user lifts their finger. Schedules the actual backend
+  /// call after [samDebounce] of inactivity rather than firing immediately,
+  /// so a quick series of corrective strokes only triggers one request.
+  void endSamBrushStrokeAndScheduleFetch() {
+    _lastSamSamplePoint = null;
+    if (_samPoints.isEmpty) {
+      samSelectPhase = SamSelectPhase.none;
+      notifyListeners();
+      return;
+    }
+    _samDebounceTimer?.cancel();
+    _samDebounceTimer = Timer(samDebounce, _runSamPredict);
+  }
+
+  Future<void> _runSamPredict() async {
+    final active = activeLayer;
+    if (active == null || _samPoints.isEmpty) return;
+
+    samSelectPhase = SamSelectPhase.processing;
+    notifyListeners();
+
+    final candidates = await _sam.segmentAtPoints(
+      image: active.pixels,
+      points: List.of(_samPoints),
+    );
+
+    if (candidates == null || candidates.isEmpty) {
+      // Backend unreachable or returned nothing — drop back to collecting
+      // so the user's points/strokes aren't silently lost, and they can
+      // retry (e.g. after fixing the backend URL) or cancel.
+      samSelectPhase = SamSelectPhase.collecting;
+      notifyListeners();
+      return;
+    }
+
+    _samCandidates = candidates;
+    _samCandidateIndex = 0;
+    samSelectPhase = SamSelectPhase.reviewing;
+    notifyListeners();
+  }
+
+  /// Switches which of the returned candidate masks is currently previewed.
+  void pickSamCandidate(int index) {
+    if (_samCandidates == null || index < 0 || index >= _samCandidates!.length) return;
+    _samCandidateIndex = index;
+    notifyListeners();
+  }
+
+  /// Goes back to brushing to refine the current selection (add more
+  /// include points, or switch to exclude and paint over what shouldn't be
+  /// there) without losing the points collected so far.
+  void resumeSamBrushRefinement() {
+    samSelectPhase = SamSelectPhase.collecting;
+    notifyListeners();
+  }
+
+  /// Commits the currently-picked candidate mask as a new layer.
+  void applySamSelection(String partName) {
+    final mask = pendingSamMask;
+    if (mask == null) return;
+    _cutMaskToNewLayer(mask, partName);
+    _clearSamSelection();
+    notifyListeners();
+  }
+
+  void cancelSamSelection() {
+    _clearSamSelection();
+    notifyListeners();
+  }
+
+  void _clearSamSelection() {
+    _samDebounceTimer?.cancel();
+    _samDebounceTimer = null;
+    _samPoints.clear();
+    _samStrokePreviewPoints = [];
+    _samCandidates = null;
+    _samCandidateIndex = 0;
+    _lastSamSamplePoint = null;
+    samSelectPhase = SamSelectPhase.none;
+  }
+
   // ---------------- Brush tools ----------------
 
   Uint8List? _strokeMask;
@@ -219,6 +355,9 @@ class EditorController extends ChangeNotifier {
     _strokeMask = Uint8List(active.width * active.height);
   }
 
+  /// Stamps a single circular dab at [imagePoint]. Called repeatedly along
+  /// an interpolated line by the canvas (not just once per pointer-move
+  /// event) so fast strokes don't leave gaps between dabs.
   void brushAt(Offset imagePoint) {
     final active = activeLayer;
     if (active == null || active.locked) return;
@@ -411,4 +550,10 @@ class EditorController extends ChangeNotifier {
   /// Exports a single layer as its own transparent PNG (for sharing just
   /// "the eyes" or "the left arm" out of the app).
   img.Image exportLayer(int index) => img.Image.from(layers[index].pixels);
+
+  @override
+  void dispose() {
+    _samDebounceTimer?.cancel();
+    super.dispose();
+  }
 }

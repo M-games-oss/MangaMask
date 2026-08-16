@@ -2,7 +2,9 @@
 enum ToolType {
   pan,           // move/zoom canvas
   smartSelect,   // on-device flood-fill "AI" region select (tap)
-  aiClickSelect, // SAM backend click/box segmentation (tap or drag box)
+  aiClickSelect, // SAM backend brush select: drag to add include points,
+                 // toggle "exclude" to correct bleed into an overlapping
+                 // part, review candidate mask(s) before committing
   polygonLasso,  // manual point-by-point lasso
   magneticLasso, // free-draw lasso that snaps to detected line-art edges
   brushErase,    // manual eraser brush
@@ -21,7 +23,7 @@ extension ToolTypeLabel on ToolType {
       case ToolType.smartSelect:
         return 'Smart Select';
       case ToolType.aiClickSelect:
-        return 'AI Select (SAM)';
+        return 'AI Brush Select (SAM)';
       case ToolType.polygonLasso:
         return 'Polygon Lasso';
       case ToolType.magneticLasso:

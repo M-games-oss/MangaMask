@@ -7,7 +7,6 @@ import 'package:provider/provider.dart';
 
 import '../models/tool_type.dart';
 import '../services/editor_controller.dart';
-import '../services/flood_fill_service.dart';
 import '../services/edge_detection_service.dart';
 
 class LayerCanvas extends StatefulWidget {
@@ -21,7 +20,12 @@ class _LayerCanvasState extends State<LayerCanvas> {
   final TransformationController _transform = TransformationController();
   List<Offset> _lassoPoints = [];
   bool _busy = false;
-  double _lastScale = 1.0;
+
+  // Last *image-space* point touched by the active brush stroke (brush
+  // erase / restore / AI remove). Used to interpolate a line of dabs
+  // between pointer-move events instead of stamping a single dot per
+  // event, which is what produced gappy/spotty strokes on fast drags.
+  Offset? _lastBrushImagePoint;
 
   Offset _toImageSpace(Offset localPos, double displayWidth, double displayHeight, int imgW, int imgH) {
     final sx = imgW / displayWidth;
@@ -30,8 +34,8 @@ class _LayerCanvasState extends State<LayerCanvas> {
   }
 
   /// Converts a 0/255 mask into a translucent orange RGBA image so it can be
-  /// drawn as a highlight overlay while the AI Remove brush is active or
-  /// waiting on the backend.
+  /// drawn as a highlight overlay while a brush stroke or SAM candidate mask
+  /// is being previewed.
   Future<ui.Image> _maskToHighlightImage(Uint8List mask, int w, int h) {
     final rgba = Uint8List(w * h * 4);
     for (var i = 0; i < mask.length; i++) {
@@ -76,9 +80,21 @@ class _LayerCanvasState extends State<LayerCanvas> {
       }
 
       // Which mask (if any) should be shown as a highlight overlay right now.
-      final Uint8List? overlayMask = controller.removalPhase != RemovalPreviewPhase.none
-          ? controller.pendingRemoveMask
-          : (controller.tool == ToolType.aiRemoveBrush ? controller.liveStrokeMask : null);
+      Uint8List? overlayMask;
+      if (controller.removalPhase != RemovalPreviewPhase.none) {
+        overlayMask = controller.pendingRemoveMask;
+      } else if (controller.tool == ToolType.aiRemoveBrush) {
+        overlayMask = controller.liveStrokeMask;
+      } else if (controller.samSelectPhase != SamSelectPhase.none) {
+        overlayMask = controller.pendingSamMask;
+      }
+
+      // Only claim the drag gesture for tools that actually use it. Leaving
+      // these null for the Pan tool lets InteractiveViewer's own pan/zoom
+      // handle the gesture instead of a GestureDetector sitting on top of it
+      // swallowing every single-finger drag — that swallow is why Pan never
+      // did anything before.
+      final bool dragHandled = controller.tool != ToolType.pan;
 
       return Center(
         // Center gives its child loose constraints, so the SizedBox below
@@ -95,9 +111,13 @@ class _LayerCanvasState extends State<LayerCanvas> {
               scaleEnabled: true,
               child: GestureDetector(
                 onTapUp: (details) => _handleTap(context, controller, details, displayW, displayH),
-                onPanStart: (details) => _handlePanStart(controller, details, displayW, displayH),
-                onPanUpdate: (details) => _handlePanUpdate(controller, details, displayW, displayH),
-                onPanEnd: (details) => _handlePanEnd(controller),
+                onPanStart: dragHandled
+                    ? (details) => _handlePanStart(controller, details, displayW, displayH)
+                    : null,
+                onPanUpdate: dragHandled
+                    ? (details) => _handlePanUpdate(controller, details, displayW, displayH)
+                    : null,
+                onPanEnd: dragHandled ? (details) => _handlePanEnd(context, controller) : null,
                 child: SizedBox(
                   width: displayW,
                   height: displayH,
@@ -117,6 +137,11 @@ class _LayerCanvasState extends State<LayerCanvas> {
                               images: snapshot.data!,
                               layers: controller.layers,
                               lassoPoints: _lassoPoints,
+                              samStrokePoints: controller.samSelectPhase == SamSelectPhase.collecting
+                                  ? controller.samStrokePreviewPoints
+                                  : const [],
+                              imageSize: Size(active.width.toDouble(), active.height.toDouble()),
+                              displaySize: Size(displayW, displayH),
                               highlightOverlay: overlaySnapshot.data,
                             ),
                             size: Size(displayW, displayH),
@@ -128,7 +153,8 @@ class _LayerCanvasState extends State<LayerCanvas> {
                 ),
               ),
             ),
-            if (controller.removalPhase == RemovalPreviewPhase.processing)
+            if (controller.removalPhase == RemovalPreviewPhase.processing ||
+                controller.samSelectPhase == SamSelectPhase.processing)
               const Padding(
                 padding: EdgeInsets.only(bottom: 24),
                 child: Card(
@@ -165,6 +191,8 @@ class _LayerCanvasState extends State<LayerCanvas> {
                   ],
                 ),
               ),
+            if (controller.samSelectPhase == SamSelectPhase.reviewing)
+              _SamReviewControls(controller: controller, busy: _busy, onApply: () => _applySamSelection(context, controller)),
           ],
         ),
       );
@@ -188,21 +216,12 @@ class _LayerCanvasState extends State<LayerCanvas> {
       final name = await _promptPartName(context);
       if (name == null) return;
       await controller.smartSelectAndCut(x, y, partName: name);
-    } else if (controller.tool == ToolType.aiClickSelect) {
-      final name = await _promptPartName(context);
-      if (name == null) return;
-      setState(() => _busy = true);
-      final ok = await controller.aiSelectAndCut(x, y, partName: name);
-      setState(() => _busy = false);
-      if (!ok && context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('AI backend unreachable — falling back to Smart Select.'),
-        ));
-        await controller.smartSelectAndCut(x, y, partName: name);
-      }
     } else if (controller.tool == ToolType.polygonLasso) {
       setState(() => _lassoPoints = [..._lassoPoints, pt]);
     }
+    // aiClickSelect no longer reacts to a plain tap — it's a drag/brush tool
+    // now (see _handlePanStart/_handlePanUpdate/_handlePanEnd), because a
+    // single point is often not enough for SAM to separate touching parts.
   }
 
   Future<String?> _promptPartName(BuildContext context) async {
@@ -223,6 +242,12 @@ class _LayerCanvasState extends State<LayerCanvas> {
     );
   }
 
+  Future<void> _applySamSelection(BuildContext context, EditorController controller) async {
+    final name = await _promptPartName(context);
+    if (name == null) return; // user cancelled — keep reviewing, nothing lost
+    controller.applySamSelection(name);
+  }
+
   void _handlePanStart(EditorController controller, DragStartDetails details, double displayW, double displayH) {
     final active = controller.activeLayer;
     if (active == null) return;
@@ -233,6 +258,11 @@ class _LayerCanvasState extends State<LayerCanvas> {
       controller.beginStroke();
       final pt = _toImageSpace(details.localPosition, displayW, displayH, active.width, active.height);
       controller.brushAt(pt);
+      _lastBrushImagePoint = pt;
+    } else if (controller.tool == ToolType.aiClickSelect) {
+      controller.beginSamBrushStroke();
+      final pt = _toImageSpace(details.localPosition, displayW, displayH, active.width, active.height);
+      controller.addSamBrushPoint(pt);
     } else if (controller.tool == ToolType.magneticLasso) {
       _lassoPoints = [details.localPosition];
       _snappedImagePoints.clear();
@@ -248,7 +278,10 @@ class _LayerCanvasState extends State<LayerCanvas> {
         controller.tool == ToolType.restoreBrush ||
         controller.tool == ToolType.aiRemoveBrush) {
       final pt = _toImageSpace(details.localPosition, displayW, displayH, active.width, active.height);
-      controller.brushAt(pt);
+      _strokeBrushTo(controller, pt);
+    } else if (controller.tool == ToolType.aiClickSelect) {
+      final pt = _toImageSpace(details.localPosition, displayW, displayH, active.width, active.height);
+      controller.addSamBrushPoint(pt);
     } else if (controller.tool == ToolType.magneticLasso) {
       final edgeMap = await controller.edgeMapForActiveLayer();
       final pt = _toImageSpace(details.localPosition, displayW, displayH, active.width, active.height);
@@ -260,18 +293,43 @@ class _LayerCanvasState extends State<LayerCanvas> {
     }
   }
 
+  /// Stamps a line of dabs from the last brushed point to [pt] instead of a
+  /// single dab at [pt]. Without this, a fast drag produces far fewer
+  /// pointer-move events than pixels crossed, leaving visible gaps between
+  /// stamps — this is what made every brush tool look spotty.
+  void _strokeBrushTo(EditorController controller, Offset pt) {
+    final last = _lastBrushImagePoint;
+    if (last == null) {
+      controller.brushAt(pt);
+    } else {
+      final dist = (pt - last).distance;
+      // Step roughly every pixel of travel; cap so a huge jump (e.g. after
+      // the pointer briefly left the widget) can't spin up thousands of
+      // stamps in one frame.
+      final steps = dist.ceil().clamp(1, 250);
+      for (var i = 1; i <= steps; i++) {
+        controller.brushAt(Offset.lerp(last, pt, i / steps)!);
+      }
+    }
+    _lastBrushImagePoint = pt;
+  }
+
   final List<Offset> _snappedImagePoints = [];
 
-  Future<void> _handlePanEnd(EditorController controller) async {
+  Future<void> _handlePanEnd(BuildContext context, EditorController controller) async {
     final active = controller.activeLayer;
     if (active == null) return;
 
     if (controller.tool == ToolType.aiRemoveBrush) {
       // Don't apply anything yet — just kick off the preview flow. The
       // Processing/Apply/Cancel UI is driven by controller.removalPhase.
+      _lastBrushImagePoint = null;
       await controller.previewAiRemoveStroke();
     } else if (controller.tool == ToolType.brushErase || controller.tool == ToolType.restoreBrush) {
+      _lastBrushImagePoint = null;
       controller.endStroke();
+    } else if (controller.tool == ToolType.aiClickSelect) {
+      controller.endSamBrushStrokeAndScheduleFetch();
     } else if (controller.tool == ToolType.magneticLasso && _snappedImagePoints.length > 2) {
       final mask = _polygonToMask(_snappedImagePoints, active.width, active.height);
       controller.manualMaskAndCut(mask, 'Lasso Cut');
@@ -329,16 +387,85 @@ class _LayerCanvasState extends State<LayerCanvas> {
   void clearLasso() => setState(() => _lassoPoints = []);
 }
 
+/// Floating controls shown once a SAM brush selection has a candidate mask
+/// to review: pick between alternatives (if more than one came back), keep
+/// refining with more strokes, cancel, or apply (which prompts for a name).
+class _SamReviewControls extends StatelessWidget {
+  const _SamReviewControls({required this.controller, required this.busy, required this.onApply});
+  final EditorController controller;
+  final bool busy;
+  final VoidCallback onApply;
+
+  @override
+  Widget build(BuildContext context) {
+    final candidates = controller.samCandidates ?? const [];
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (candidates.length > 1)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  for (var i = 0; i < candidates.length; i++)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 4),
+                      child: ChoiceChip(
+                        label: Text('Option ${i + 1} · ${(candidates[i].score * 100).round()}%'),
+                        selected: controller.samCandidateIndex == i,
+                        onSelected: (_) => controller.pickSamCandidate(i),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ElevatedButton.icon(
+                onPressed: controller.cancelSamSelection,
+                icon: const Icon(Icons.close),
+                label: const Text('Cancel'),
+              ),
+              const SizedBox(width: 8),
+              ElevatedButton.icon(
+                onPressed: controller.resumeSamBrushRefinement,
+                icon: const Icon(Icons.brush),
+                label: const Text('Refine'),
+              ),
+              const SizedBox(width: 8),
+              ElevatedButton.icon(
+                onPressed: onApply,
+                icon: const Icon(Icons.check),
+                label: const Text('Apply'),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _CompositePainter extends CustomPainter {
   _CompositePainter({
     required this.images,
     required this.layers,
     required this.lassoPoints,
+    required this.samStrokePoints,
+    required this.imageSize,
+    required this.displaySize,
     this.highlightOverlay,
   });
   final List<ui.Image> images;
   final List layers;
   final List<Offset> lassoPoints;
+  final List<Offset> samStrokePoints; // image-space points from the SAM brush
+  final Size imageSize;
+  final Size displaySize;
   final ui.Image? highlightOverlay;
 
   @override
@@ -376,6 +503,15 @@ class _CompositePainter extends CustomPainter {
           ..style = PaintingStyle.stroke
           ..strokeWidth = 2,
       );
+    }
+
+    if (samStrokePoints.isNotEmpty && imageSize.width > 0 && imageSize.height > 0) {
+      final sx = displaySize.width / imageSize.width;
+      final sy = displaySize.height / imageSize.height;
+      final dotPaint = Paint()..color = Colors.cyanAccent;
+      for (final p in samStrokePoints) {
+        canvas.drawCircle(Offset(p.dx * sx, p.dy * sy), 3, dotPaint);
+      }
     }
   }
 

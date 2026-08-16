@@ -2,8 +2,10 @@
 Manga Cutter AI backend.
 
 Serves two capabilities the Flutter app calls over HTTP:
-  1. POST /segment_point, /segment_box  -> SAM / MobileSAM click/box segmentation
-  2. POST /inpaint                       -> LaMa inpainting for the AI Remove brush
+  1. POST /segment_point, /segment_box, /segment_points -> SAM / MobileSAM
+     click / box / multi-point segmentation
+  2. POST /inpaint                                       -> LaMa inpainting
+     for the AI Remove brush
 
 Run locally:
     pip install -r requirements.txt
@@ -20,16 +22,21 @@ Model choice notes:
     GPU and want maximum mask quality.
   - There is no manga-specific fine-grained anatomy model to download, because
     none is publicly available. SAM is class-agnostic: it segments whatever
-    coherent region contains your click, at whatever granularity that region
-    has, which is why it works for "the iris" as well as "the whole arm"
-    without per-class training.
+    coherent region contains your prompt points, at whatever granularity that
+    region has. On flat-shaded, low-contrast boundaries (an arm resting over
+    a torso with no hard line between them) a single point is often not
+    enough information for SAM to guess correctly - which is why
+    /segment_points exists: multiple include/exclude points let the client
+    disambiguate a case a single tap can't.
   - Inpainting uses simple-lama-inpainting (LaMa), which is a strong general
     purpose "remove and fill" model and works reasonably on line-art/flat-color
     manga panels too.
 """
 
 import base64
+import hashlib
 import io
+import os
 
 import numpy as np
 from fastapi import FastAPI
@@ -51,8 +58,6 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 _sam_predictor = None
 _lama_model = None
-
-import os
 
 SAM_MODEL = os.environ.get("SAM_MODEL", "mobile")  # "mobile" or "full"
 
@@ -85,14 +90,75 @@ def get_lama_model():
     return _lama_model
 
 
-def decode_png_b64(data: str) -> Image.Image:
-    return Image.open(io.BytesIO(base64.b64decode(data))).convert("RGB")
+# ---------------------------------------------------------------------------
+# Image-embedding cache.
+#
+# predictor.set_image() runs the (slow) SAM image encoder. In a debounced
+# brush-select flow the client calls the backend repeatedly *for the same
+# image* as the user refines their stroke - re-encoding the whole image on
+# every one of those calls is the difference between a ~150ms and a ~2-3s
+# response on CPU. SamPredictor caches its encoder output on the instance as
+# `.features` after set_image(), so we snapshot that (plus the size fields it
+# needs) keyed by a hash of the image bytes, and restore it instead of
+# re-encoding when the same image comes in again. Small LRU-ish cap so this
+# can't grow unbounded across a long session with many different images.
+# ---------------------------------------------------------------------------
+_embedding_cache: dict[str, dict] = {}
+_EMBEDDING_CACHE_MAX = 4
+
+
+def _image_hash(png_bytes: bytes) -> str:
+    return hashlib.sha256(png_bytes).hexdigest()
+
+
+def _set_image_cached(predictor, raw_png_bytes: bytes, np_image: np.ndarray) -> None:
+    h = _image_hash(raw_png_bytes)
+    cached = _embedding_cache.get(h)
+    if cached is not None:
+        predictor.features = cached["features"]
+        predictor.original_size = cached["original_size"]
+        predictor.input_size = cached["input_size"]
+        predictor.is_image_set = True
+        return
+
+    predictor.set_image(np_image)
+    _embedding_cache[h] = {
+        "features": predictor.features,
+        "original_size": predictor.original_size,
+        "input_size": predictor.input_size,
+    }
+    if len(_embedding_cache) > _EMBEDDING_CACHE_MAX:
+        _embedding_cache.pop(next(iter(_embedding_cache)))
+
+
+def decode_png_b64_raw(data: str) -> tuple[bytes, Image.Image]:
+    raw = base64.b64decode(data)
+    return raw, Image.open(io.BytesIO(raw)).convert("RGB")
 
 
 def encode_png_b64(img: Image.Image) -> str:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode()
+
+
+def _top_candidates(masks: np.ndarray, scores: np.ndarray, limit: int = 3) -> list[dict]:
+    """Sorts SAM's mask proposals by score (best first) and returns up to
+    `limit` of them as base64 PNGs with their scores, instead of silently
+    keeping only the single top-scoring one. On a flat-background manga
+    panel, the "highest confidence" mask is sometimes the whole background
+    or the whole figure - giving the client all 3 lets it show real
+    alternatives instead of committing to a guess with no way to correct it.
+    """
+    order = np.argsort(scores)[::-1][:limit]
+    out = []
+    for idx in order:
+        mask_img = Image.fromarray((masks[idx] * 255).astype(np.uint8))
+        out.append({
+            "mask_png_base64": encode_png_b64(mask_img),
+            "score": float(scores[idx]),
+        })
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +174,17 @@ class SegmentPointRequest(BaseModel):
 class SegmentBoxRequest(BaseModel):
     image_png_base64: str
     box: list[int]  # [x0, y0, x1, y1]
+
+
+class PointPrompt(BaseModel):
+    x: int
+    y: int
+    label: int  # 1 = include, 0 = exclude
+
+
+class SegmentPointsRequest(BaseModel):
+    image_png_base64: str
+    points: list[PointPrompt]
 
 
 class InpaintRequest(BaseModel):
@@ -126,42 +203,65 @@ def health():
 @app.post("/segment_point")
 def segment_point(req: SegmentPointRequest):
     predictor = get_sam_predictor()
-    image = decode_png_b64(req.image_png_base64)
+    raw, image = decode_png_b64_raw(req.image_png_base64)
     np_image = np.array(image)
-    predictor.set_image(np_image)
+    _set_image_cached(predictor, raw, np_image)
 
     masks, scores, _ = predictor.predict(
         point_coords=np.array([[req.x, req.y]]),
         point_labels=np.array([req.label]),
         multimask_output=True,
     )
-    best = masks[int(np.argmax(scores))]
-    mask_img = Image.fromarray((best * 255).astype(np.uint8))
-    return {"mask_png_base64": encode_png_b64(mask_img)}
+    return {"candidates": _top_candidates(masks, scores)}
 
 
 @app.post("/segment_box")
 def segment_box(req: SegmentBoxRequest):
     predictor = get_sam_predictor()
-    image = decode_png_b64(req.image_png_base64)
+    raw, image = decode_png_b64_raw(req.image_png_base64)
     np_image = np.array(image)
-    predictor.set_image(np_image)
+    _set_image_cached(predictor, raw, np_image)
 
     masks, scores, _ = predictor.predict(
         box=np.array(req.box),
         multimask_output=True,
     )
-    best = masks[int(np.argmax(scores))]
-    mask_img = Image.fromarray((best * 255).astype(np.uint8))
-    return {"mask_png_base64": encode_png_b64(mask_img)}
+    return {"candidates": _top_candidates(masks, scores)}
+
+
+@app.post("/segment_points")
+def segment_points(req: SegmentPointsRequest):
+    """Multi-point prompt: a mix of include (label=1) and exclude (label=0)
+    points, e.g. sampled along a brush stroke plus an "exclude" stroke drawn
+    over an overlapping limb. This is what the app's SAM brush tool calls -
+    letting the user correct SAM's guess with more points instead of only
+    ever getting one shot from a single tap.
+    """
+    if not req.points:
+        return {"candidates": []}
+
+    predictor = get_sam_predictor()
+    raw, image = decode_png_b64_raw(req.image_png_base64)
+    np_image = np.array(image)
+    _set_image_cached(predictor, raw, np_image)
+
+    coords = np.array([[p.x, p.y] for p in req.points])
+    labels = np.array([p.label for p in req.points])
+
+    masks, scores, _ = predictor.predict(
+        point_coords=coords,
+        point_labels=labels,
+        multimask_output=True,
+    )
+    return {"candidates": _top_candidates(masks, scores)}
 
 
 @app.post("/inpaint")
 def inpaint(req: InpaintRequest):
     lama = get_lama_model()
-    image = decode_png_b64(req.image_png_base64)
-    mask = decode_png_b64(req.mask_png_base64).convert("L")
-    result = lama(image, mask)
+    _, image = decode_png_b64_raw(req.image_png_base64)
+    _, mask = decode_png_b64_raw(req.mask_png_base64)
+    result = lama(image, mask.convert("L"))
     return {"result_png_base64": encode_png_b64(result)}
 
 

@@ -25,6 +25,23 @@ class ToolbarWidget extends StatelessWidget {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
+          // Persistent label for whichever tool is currently selected —
+          // tooltips only show up on long-press/hover, which isn't
+          // discoverable enough on a row of similar-looking icons.
+          Padding(
+            padding: const EdgeInsets.only(left: 8, bottom: 2),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                controller.tool.label,
+                style: const TextStyle(
+                  color: Colors.cyanAccent,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ),
           SingleChildScrollView(
             scrollDirection: Axis.horizontal,
             child: Row(
@@ -95,6 +112,37 @@ class ToolbarWidget extends StatelessWidget {
                 Text('${controller.floodFillTolerance}', style: const TextStyle(color: Colors.white70)),
                 const SizedBox(width: 12),
               ],
+            ),
+          if (controller.tool == ToolType.aiClickSelect)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+              child: Row(
+                children: [
+                  const Text('Brush mode', style: TextStyle(color: Colors.white70, fontSize: 12)),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: SegmentedButton<bool>(
+                      segments: const [
+                        ButtonSegment(
+                          value: false,
+                          label: Text('Include'),
+                          icon: Icon(Icons.add_circle_outline, size: 16),
+                        ),
+                        ButtonSegment(
+                          value: true,
+                          label: Text('Exclude'),
+                          icon: Icon(Icons.remove_circle_outline, size: 16),
+                        ),
+                      ],
+                      selected: {controller.samBrushExclude},
+                      onSelectionChanged: (selection) {
+                        controller.samBrushExclude = selection.first;
+                        controller.notifyListeners();
+                      },
+                    ),
+                  ),
+                ],
+              ),
             ),
         ],
       ),
