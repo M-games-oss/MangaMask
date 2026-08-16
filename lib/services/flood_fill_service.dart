@@ -22,9 +22,19 @@ class FloodFillService {
     if (startX < 0 || startY < 0 || startX >= w || startY >= h) return mask;
 
     final seed = image.getPixel(startX, startY);
+
+    // If the seed pixel has already been cut out (fully transparent), there
+    // is nothing here to select. Without this guard, flood fill happily
+    // treats the punched-out hole as a uniform "near-black" region and
+    // re-selects the entire hole every time it's tapped again.
+    if (seed.a == 0) return mask;
+
     final seedR = seed.r, seedG = seed.g, seedB = seed.b;
 
     bool close(img.Pixel p) {
+      // Never merge into already-cut (transparent) pixels — they aren't
+      // real artwork, just the hole left behind by a previous cut.
+      if (p.a == 0) return false;
       final dr = (p.r - seedR).abs();
       final dg = (p.g - seedG).abs();
       final db = (p.b - seedB).abs();

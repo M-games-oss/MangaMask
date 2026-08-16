@@ -12,6 +12,12 @@ import 'edit_history_service.dart';
 import 'sam_backend_service.dart';
 import 'inpainting_backend_service.dart';
 
+/// Tracks where an AI Remove brush stroke currently is in its lifecycle:
+///   none       - no stroke in flight, nothing pending
+///   processing - stroke just ended, waiting on the inpaint backend
+///   reviewing  - backend responded, showing Apply/Cancel to the user
+enum RemovalPreviewPhase { none, processing, reviewing }
+
 class EditorController extends ChangeNotifier {
   EditorController();
 
@@ -107,6 +113,11 @@ class EditorController extends ChangeNotifier {
   Future<void> smartSelectAndCut(int x, int y, {required String partName}) async {
     final active = activeLayer;
     if (active == null || active.locked) return;
+    // Guard against re-cutting an already-cut (transparent) spot — clicking
+    // the same location again would otherwise flood-fill the punched-out
+    // hole and produce a phantom empty layer.
+    if (active.pixels.getPixel(x, y).a == 0) return;
+
     final mask = FloodFillService.selectContiguous(
       image: active.pixels,
       startX: x,
@@ -123,6 +134,10 @@ class EditorController extends ChangeNotifier {
   Future<bool> aiSelectAndCut(int x, int y, {required String partName}) async {
     final active = activeLayer;
     if (active == null || active.locked) return false;
+    // Same guard as smartSelectAndCut — skip the network call entirely if
+    // the tapped pixel is already a punched-out hole.
+    if (active.pixels.getPixel(x, y).a == 0) return false;
+
     final mask = await _sam.segmentAtPoint(image: active.pixels, x: x, y: y);
     if (mask == null) return false;
     _cutMaskToNewLayer(mask, partName);
@@ -133,6 +148,8 @@ class EditorController extends ChangeNotifier {
     int x0, int y0, int x1, int y1, {required String partName}) async {
     final active = activeLayer;
     if (active == null || active.locked) return false;
+    if (active.pixels.getPixel(x0, y0).a == 0) return false;
+
     final mask = await _sam.segmentInBox(
       image: active.pixels, x0: x0, y0: y0, x1: x1, y1: y1);
     if (mask == null) return false;
@@ -175,14 +192,32 @@ class EditorController extends ChangeNotifier {
 
   // ---------------- Brush tools ----------------
 
+  Uint8List? _strokeMask;
+
+  /// The in-progress brush mask, exposed read-only so the canvas can paint
+  /// a live highlight overlay while the user is dragging.
+  Uint8List? get liveStrokeMask => _strokeMask;
+
+  // ---- AI Remove brush preview state ----
+  RemovalPreviewPhase removalPhase = RemovalPreviewPhase.none;
+  Uint8List? _pendingRemoveMask;
+  Uint8List? get pendingRemoveMask => _pendingRemoveMask;
+  img.Image? _pendingRemoveResult;
+  img.Image? get pendingRemovePreviewImage => _pendingRemoveResult;
+  img.Image? _preRemovalSnapshot;
+
   void beginStroke() {
     final active = activeLayer;
     if (active == null) return;
-    history.recordBeforeEdit(active.id, active.pixels);
+    if (tool == ToolType.aiRemoveBrush) {
+      // Don't touch undo history yet — nothing is actually committed to the
+      // layer until the user taps Apply, so there's nothing to "undo" yet.
+      _preRemovalSnapshot = img.Image.from(active.pixels);
+    } else {
+      history.recordBeforeEdit(active.id, active.pixels);
+    }
     _strokeMask = Uint8List(active.width * active.height);
   }
-
-  Uint8List? _strokeMask;
 
   void brushAt(Offset imagePoint) {
     final active = activeLayer;
@@ -212,6 +247,9 @@ class EditorController extends ChangeNotifier {
             pixels.setPixelRgba(xx, yy, o.r, o.g, o.b, o.a);
             break;
           case ToolType.aiRemoveBrush:
+            // Only mark the mask here — actual pixels aren't touched until
+            // the stroke ends and (later) the user taps Apply. The canvas
+            // reads liveStrokeMask to show a highlight while this happens.
             _strokeMask?[yy * w + xx] = 255;
             break;
           default:
@@ -224,17 +262,45 @@ class EditorController extends ChangeNotifier {
   }
 
   /// Call when the user lifts their finger after an AI-remove brush stroke.
-  /// Sends the brushed mask to the inpainting backend and replaces those
-  /// pixels with the AI-filled result. Falls back to a soft transparent
-  /// erase (feathered) if no backend is reachable.
-  Future<void> endAiRemoveStroke() async {
+  /// Sends the brushed mask to the inpainting backend but does NOT modify
+  /// the layer yet — the result is stashed as "pending" so the UI can show
+  /// a review step. Call applyPendingRemoval() or cancelPendingRemoval() to
+  /// resolve it.
+  Future<void> previewAiRemoveStroke() async {
     final active = activeLayer;
     final mask = _strokeMask;
-    if (active == null || mask == null) return;
+    if (active == null || mask == null) {
+      _strokeMask = null;
+      return;
+    }
+
+    _pendingRemoveMask = mask;
+    removalPhase = RemovalPreviewPhase.processing;
+    notifyListeners();
 
     final result = await _inpaint.inpaint(image: active.pixels, maskBrushedArea: mask);
-    if (result.image != null) {
-      active.replacePixels(result.image!);
+    // null result.image means the backend was unreachable — applying will
+    // fall back to a soft transparent erase, same as before.
+    _pendingRemoveResult = result.image;
+    removalPhase = RemovalPreviewPhase.reviewing;
+    notifyListeners();
+  }
+
+  /// Commits the pending AI-remove result (or fallback erase) to the layer.
+  void applyPendingRemoval() {
+    final active = activeLayer;
+    final mask = _pendingRemoveMask;
+    if (active == null || mask == null) {
+      _clearPendingRemoval();
+      return;
+    }
+
+    if (_preRemovalSnapshot != null) {
+      history.recordBeforeEdit(active.id, _preRemovalSnapshot!);
+    }
+
+    if (_pendingRemoveResult != null) {
+      active.replacePixels(_pendingRemoveResult!);
     } else {
       // Fallback: feathered transparent erase over the brushed mask.
       final feathered = FloodFillService.dilate(mask, active.width, active.height, 0);
@@ -248,8 +314,23 @@ class EditorController extends ChangeNotifier {
       }
       active.replacePixels(pixels);
     }
-    _strokeMask = null;
+
+    _clearPendingRemoval();
     notifyListeners();
+  }
+
+  /// Discards the pending AI-remove result without touching the layer.
+  void cancelPendingRemoval() {
+    _clearPendingRemoval();
+    notifyListeners();
+  }
+
+  void _clearPendingRemoval() {
+    _strokeMask = null;
+    _pendingRemoveMask = null;
+    _pendingRemoveResult = null;
+    _preRemovalSnapshot = null;
+    removalPhase = RemovalPreviewPhase.none;
   }
 
   void endStroke() {

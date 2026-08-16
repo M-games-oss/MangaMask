@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
@@ -28,6 +29,24 @@ class _LayerCanvasState extends State<LayerCanvas> {
     return Offset(localPos.dx * sx, localPos.dy * sy);
   }
 
+  /// Converts a 0/255 mask into a translucent orange RGBA image so it can be
+  /// drawn as a highlight overlay while the AI Remove brush is active or
+  /// waiting on the backend.
+  Future<ui.Image> _maskToHighlightImage(Uint8List mask, int w, int h) {
+    final rgba = Uint8List(w * h * 4);
+    for (var i = 0; i < mask.length; i++) {
+      if (mask[i] != 0) {
+        rgba[i * 4] = 255;
+        rgba[i * 4 + 1] = 160;
+        rgba[i * 4 + 2] = 0;
+        rgba[i * 4 + 3] = 140; // translucent orange
+      }
+    }
+    final completer = Completer<ui.Image>();
+    ui.decodeImageFromPixels(rgba, w, h, ui.PixelFormat.rgba8888, completer.complete);
+    return completer.future;
+  }
+
   @override
   Widget build(BuildContext context) {
     final controller = context.watch<EditorController>();
@@ -37,40 +56,116 @@ class _LayerCanvasState extends State<LayerCanvas> {
     }
 
     return LayoutBuilder(builder: (context, constraints) {
-      final displayW = constraints.maxWidth;
-      final displayH = constraints.maxWidth * active.height / active.width;
+      // Fit the image within whatever box we're given, preserving aspect
+      // ratio on BOTH axes (not just width) — fixes the squish that
+      // happened when a parent gave tight constraints on both dimensions.
+      final maxW = constraints.maxWidth.isFinite ? constraints.maxWidth : active.width.toDouble();
+      final maxH = constraints.maxHeight.isFinite ? constraints.maxHeight : active.height.toDouble();
+      final imageAspect = active.width / active.height;
+      final boxAspect = maxW / maxH;
 
-      return InteractiveViewer(
-        transformationController: _transform,
-        maxScale: 8,
-        minScale: 0.5,
-        panEnabled: controller.tool == ToolType.pan,
-        scaleEnabled: true,
-        child: GestureDetector(
-          onTapUp: (details) => _handleTap(context, controller, details, displayW, displayH),
-          onPanStart: (details) => _handlePanStart(controller, details, displayW, displayH),
-          onPanUpdate: (details) => _handlePanUpdate(controller, details, displayW, displayH),
-          onPanEnd: (details) => _handlePanEnd(controller),
-          child: SizedBox(
-            width: displayW,
-            height: displayH,
-            child: FutureBuilder<List<ui.Image>>(
-              future: Future.wait(controller.layers.map((l) => l.uiImage())),
-              builder: (context, snapshot) {
-                if (!snapshot.hasData) {
-                  return const Center(child: CircularProgressIndicator());
-                }
-                return CustomPaint(
-                  painter: _CompositePainter(
-                    images: snapshot.data!,
-                    layers: controller.layers,
-                    lassoPoints: _lassoPoints,
+      double displayW, displayH;
+      if (imageAspect > boxAspect) {
+        // Image is relatively wider than the available box -> fit to width.
+        displayW = maxW;
+        displayH = maxW / imageAspect;
+      } else {
+        // Image is relatively taller -> fit to height.
+        displayH = maxH;
+        displayW = maxH * imageAspect;
+      }
+
+      // Which mask (if any) should be shown as a highlight overlay right now.
+      final Uint8List? overlayMask = controller.removalPhase != RemovalPreviewPhase.none
+          ? controller.pendingRemoveMask
+          : (controller.tool == ToolType.aiRemoveBrush ? controller.liveStrokeMask : null);
+
+      return Center(
+        // Center gives its child loose constraints, so the SizedBox below
+        // keeps its aspect-correct requested size instead of being forced
+        // to fill a tight parent box (which is what was causing the squish).
+        child: Stack(
+          alignment: Alignment.bottomCenter,
+          children: [
+            InteractiveViewer(
+              transformationController: _transform,
+              maxScale: 8,
+              minScale: 0.5,
+              panEnabled: controller.tool == ToolType.pan,
+              scaleEnabled: true,
+              child: GestureDetector(
+                onTapUp: (details) => _handleTap(context, controller, details, displayW, displayH),
+                onPanStart: (details) => _handlePanStart(controller, details, displayW, displayH),
+                onPanUpdate: (details) => _handlePanUpdate(controller, details, displayW, displayH),
+                onPanEnd: (details) => _handlePanEnd(controller),
+                child: SizedBox(
+                  width: displayW,
+                  height: displayH,
+                  child: FutureBuilder<List<ui.Image>>(
+                    future: Future.wait(controller.layers.map((l) => l.uiImage())),
+                    builder: (context, snapshot) {
+                      if (!snapshot.hasData) {
+                        return const Center(child: CircularProgressIndicator());
+                      }
+                      return FutureBuilder<ui.Image?>(
+                        future: overlayMask == null
+                            ? Future.value(null)
+                            : _maskToHighlightImage(overlayMask, active.width, active.height),
+                        builder: (context, overlaySnapshot) {
+                          return CustomPaint(
+                            painter: _CompositePainter(
+                              images: snapshot.data!,
+                              layers: controller.layers,
+                              lassoPoints: _lassoPoints,
+                              highlightOverlay: overlaySnapshot.data,
+                            ),
+                            size: Size(displayW, displayH),
+                          );
+                        },
+                      );
+                    },
                   ),
-                  size: Size(displayW, displayH),
-                );
-              },
+                ),
+              ),
             ),
-          ),
+            if (controller.removalPhase == RemovalPreviewPhase.processing)
+              const Padding(
+                padding: EdgeInsets.only(bottom: 24),
+                child: Card(
+                  child: Padding(
+                    padding: EdgeInsets.all(12),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                        SizedBox(width: 12),
+                        Text('Processing...'),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            if (controller.removalPhase == RemovalPreviewPhase.reviewing)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 24),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    ElevatedButton.icon(
+                      onPressed: controller.cancelPendingRemoval,
+                      icon: const Icon(Icons.close),
+                      label: const Text('Cancel'),
+                    ),
+                    const SizedBox(width: 12),
+                    ElevatedButton.icon(
+                      onPressed: controller.applyPendingRemoval,
+                      icon: const Icon(Icons.check),
+                      label: const Text('Apply'),
+                    ),
+                  ],
+                ),
+              ),
+          ],
         ),
       );
     });
@@ -172,9 +267,9 @@ class _LayerCanvasState extends State<LayerCanvas> {
     if (active == null) return;
 
     if (controller.tool == ToolType.aiRemoveBrush) {
-      setState(() => _busy = true);
-      await controller.endAiRemoveStroke();
-      setState(() => _busy = false);
+      // Don't apply anything yet — just kick off the preview flow. The
+      // Processing/Apply/Cancel UI is driven by controller.removalPhase.
+      await controller.previewAiRemoveStroke();
     } else if (controller.tool == ToolType.brushErase || controller.tool == ToolType.restoreBrush) {
       controller.endStroke();
     } else if (controller.tool == ToolType.magneticLasso && _snappedImagePoints.length > 2) {
@@ -235,10 +330,16 @@ class _LayerCanvasState extends State<LayerCanvas> {
 }
 
 class _CompositePainter extends CustomPainter {
-  _CompositePainter({required this.images, required this.layers, required this.lassoPoints});
+  _CompositePainter({
+    required this.images,
+    required this.layers,
+    required this.lassoPoints,
+    this.highlightOverlay,
+  });
   final List<ui.Image> images;
   final List layers;
   final List<Offset> lassoPoints;
+  final ui.Image? highlightOverlay;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -258,6 +359,12 @@ class _CompositePainter extends CustomPainter {
         size.height,
       );
       canvas.drawImageRect(images[i], srcRect, dstRect, paint);
+    }
+
+    if (highlightOverlay != null) {
+      final srcRect = Rect.fromLTWH(
+          0, 0, highlightOverlay!.width.toDouble(), highlightOverlay!.height.toDouble());
+      canvas.drawImageRect(highlightOverlay!, srcRect, Offset.zero & size, Paint());
     }
 
     if (lassoPoints.length > 1) {

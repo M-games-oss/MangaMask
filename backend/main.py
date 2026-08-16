@@ -52,14 +52,25 @@ app.add_middleware(
 _sam_predictor = None
 _lama_model = None
 
-MODEL_TYPE = "vit_t"  # MobileSAM. Use "vit_h" + matching checkpoint for full SAM.
-CHECKPOINT_PATH = "weights/mobile_sam.pt"
+import os
+
+SAM_MODEL = os.environ.get("SAM_MODEL", "mobile")  # "mobile" or "full"
+
+if SAM_MODEL == "full":
+    MODEL_TYPE = "vit_h"
+    CHECKPOINT_PATH = "weights/sam_vit_h_4b8939.pth"
+else:
+    MODEL_TYPE = "vit_t"
+    CHECKPOINT_PATH = "weights/mobile_sam.pt"
 
 
 def get_sam_predictor():
     global _sam_predictor
     if _sam_predictor is None:
-        from mobile_sam import SamPredictor, sam_model_registry
+        if SAM_MODEL == "full":
+            from segment_anything import SamPredictor, sam_model_registry
+        else:
+            from mobile_sam import SamPredictor, sam_model_registry
         sam = sam_model_registry[MODEL_TYPE](checkpoint=CHECKPOINT_PATH)
         sam.eval()
         _sam_predictor = SamPredictor(sam)
