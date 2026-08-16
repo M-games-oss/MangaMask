@@ -31,6 +31,16 @@ class _EditorScreenState extends State<EditorScreen> {
         title: const Text('Manga Cutter'),
         actions: [
           IconButton(
+            tooltip: 'Undo',
+            icon: const Icon(Icons.undo),
+            onPressed: controller.history.canUndo ? controller.undo : null,
+          ),
+          IconButton(
+            tooltip: 'Redo',
+            icon: const Icon(Icons.redo),
+            onPressed: controller.history.canRedo ? controller.redo : null,
+          ),
+          IconButton(
             tooltip: 'Import image',
             icon: const Icon(Icons.file_open_outlined),
             onPressed: () => _importImage(context),

@@ -121,34 +121,57 @@ class _LayerCanvasState extends State<LayerCanvas> {
                 child: SizedBox(
                   width: displayW,
                   height: displayH,
-                  child: FutureBuilder<List<ui.Image>>(
-                    future: Future.wait(controller.layers.map((l) => l.uiImage())),
-                    builder: (context, snapshot) {
-                      if (!snapshot.hasData) {
-                        return const Center(child: CircularProgressIndicator());
-                      }
-                      return FutureBuilder<ui.Image?>(
-                        future: overlayMask == null
-                            ? Future.value(null)
-                            : _maskToHighlightImage(overlayMask, active.width, active.height),
-                        builder: (context, overlaySnapshot) {
-                          return CustomPaint(
-                            painter: _CompositePainter(
-                              images: snapshot.data!,
-                              layers: controller.layers,
-                              lassoPoints: _lassoPoints,
-                              samStrokePoints: controller.samSelectPhase == SamSelectPhase.collecting
-                                  ? controller.samStrokePreviewPoints
-                                  : const [],
-                              imageSize: Size(active.width.toDouble(), active.height.toDouble()),
-                              displaySize: Size(displayW, displayH),
-                              highlightOverlay: overlaySnapshot.data,
-                            ),
-                            size: Size(displayW, displayH),
+                  child: Stack(
+                    children: [
+                      FutureBuilder<List<ui.Image>>(
+                        future: Future.wait(controller.layers.map((l) => l.uiImage())),
+                        builder: (context, snapshot) {
+                          if (!snapshot.hasData) {
+                            return const Center(child: CircularProgressIndicator());
+                          }
+                          return FutureBuilder<ui.Image?>(
+                            future: overlayMask == null
+                                ? Future.value(null)
+                                : _maskToHighlightImage(overlayMask, active.width, active.height),
+                            builder: (context, overlaySnapshot) {
+                              return CustomPaint(
+                                painter: _CompositePainter(
+                                  images: snapshot.data!,
+                                  layers: controller.layers,
+                                  lassoPoints: _lassoPoints,
+                                  highlightOverlay: overlaySnapshot.data,
+                                ),
+                                size: Size(displayW, displayH),
+                              );
+                            },
                           );
                         },
-                      );
-                    },
+                      ),
+                      // Live SAM-brush stroke preview lives in its own tiny
+                      // repaint layer, driven by a ValueNotifier instead of
+                      // controller.notifyListeners(). This is what stops
+                      // brushing from re-triggering the FutureBuilder chain
+                      // above (and the full layer image lookup it does) on
+                      // every single sampled point.
+                      if (controller.tool == ToolType.aiClickSelect)
+                        IgnorePointer(
+                          child: ValueListenableBuilder<List<Offset>>(
+                            valueListenable: controller.samStrokeNotifier,
+                            builder: (context, points, _) {
+                              return CustomPaint(
+                                painter: _SamStrokePainter(
+                                  points: points,
+                                  imageSize: Size(active.width.toDouble(), active.height.toDouble()),
+                                  displaySize: Size(displayW, displayH),
+                                  strokeWidthImagePx: controller.brushSize,
+                                  exclude: controller.samBrushExclude,
+                                ),
+                                size: Size(displayW, displayH),
+                              );
+                            },
+                          ),
+                        ),
+                    ],
                   ),
                 ),
               ),
@@ -450,22 +473,72 @@ class _SamReviewControls extends StatelessWidget {
   }
 }
 
+/// Draws the live SAM-brush stroke as a continuous line (rounded caps/joins,
+/// scaled to the brush size) rather than a series of separate dots — a row
+/// of unconnected circles is what made the tool look like it was "dropping
+/// circles" instead of behaving like a brush.
+class _SamStrokePainter extends CustomPainter {
+  _SamStrokePainter({
+    required this.points,
+    required this.imageSize,
+    required this.displaySize,
+    required this.strokeWidthImagePx,
+    required this.exclude,
+  });
+  final List<Offset> points; // image-space
+  final Size imageSize;
+  final Size displaySize;
+  final double strokeWidthImagePx;
+  final bool exclude;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (points.isEmpty || imageSize.width <= 0 || imageSize.height <= 0) return;
+    final sx = displaySize.width / imageSize.width;
+    final sy = displaySize.height / imageSize.height;
+    final color = (exclude ? Colors.redAccent : Colors.cyanAccent).withOpacity(0.45);
+
+    if (points.length == 1) {
+      canvas.drawCircle(
+        Offset(points.first.dx * sx, points.first.dy * sy),
+        strokeWidthImagePx * sx / 2,
+        Paint()..color = color,
+      );
+      return;
+    }
+
+    final path = Path()..moveTo(points.first.dx * sx, points.first.dy * sy);
+    for (final p in points.skip(1)) {
+      path.lineTo(p.dx * sx, p.dy * sy);
+    }
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = color
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = strokeWidthImagePx * sx
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _SamStrokePainter oldDelegate) =>
+      oldDelegate.points != points ||
+      oldDelegate.exclude != exclude ||
+      oldDelegate.strokeWidthImagePx != strokeWidthImagePx;
+}
+
 class _CompositePainter extends CustomPainter {
   _CompositePainter({
     required this.images,
     required this.layers,
     required this.lassoPoints,
-    required this.samStrokePoints,
-    required this.imageSize,
-    required this.displaySize,
     this.highlightOverlay,
   });
   final List<ui.Image> images;
   final List layers;
   final List<Offset> lassoPoints;
-  final List<Offset> samStrokePoints; // image-space points from the SAM brush
-  final Size imageSize;
-  final Size displaySize;
   final ui.Image? highlightOverlay;
 
   @override
@@ -503,15 +576,6 @@ class _CompositePainter extends CustomPainter {
           ..style = PaintingStyle.stroke
           ..strokeWidth = 2,
       );
-    }
-
-    if (samStrokePoints.isNotEmpty && imageSize.width > 0 && imageSize.height > 0) {
-      final sx = displaySize.width / imageSize.width;
-      final sy = displaySize.height / imageSize.height;
-      final dotPaint = Paint()..color = Colors.cyanAccent;
-      for (final p in samStrokePoints) {
-        canvas.drawCircle(Offset(p.dx * sx, p.dy * sy), 3, dotPaint);
-      }
     }
   }
 

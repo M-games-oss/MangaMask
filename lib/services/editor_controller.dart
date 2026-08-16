@@ -187,7 +187,6 @@ class EditorController extends ChangeNotifier {
   // brush more to refine, and only cuts when they explicitly apply.
 
   static const Duration samDebounce = Duration(milliseconds: 400);
-  static const double _samSampleSpacingPx = 10; // min image-px between sampled points
 
   /// Whether the next brush stroke adds include or exclude points. Flipped
   /// by a toolbar toggle. Exclude points are how you tell SAM "not this
@@ -197,13 +196,41 @@ class EditorController extends ChangeNotifier {
 
   SamSelectPhase samSelectPhase = SamSelectPhase.none;
   final List<SamPointPrompt> _samPoints = [];
-  List<Offset> _samStrokePreviewPoints = []; // image-space, for drawing dots while collecting
-  List<Offset> get samStrokePreviewPoints => _samStrokePreviewPoints;
+
+  /// Live brush-stroke points (image-space) while the user is dragging.
+  /// Exposed as a ValueNotifier rather than routed through
+  /// notifyListeners() so the canvas can repaint just the stroke-preview
+  /// layer on every sampled point without rebuilding the whole widget tree
+  /// — including the layered-image FutureBuilder chain — which is what was
+  /// making brushing feel laggy.
+  final ValueNotifier<List<Offset>> samStrokeNotifier = ValueNotifier<List<Offset>>([]);
+
+  /// Minimum image-space distance between sampled points. Scales with brush
+  /// size so a bigger brush (coarser, faster strokes) doesn't oversample.
+  double get samBrushSampleSpacing => max(4.0, brushSize / 3);
 
   List<SamMaskCandidate>? _samCandidates;
   int _samCandidateIndex = 0;
   Timer? _samDebounceTimer;
   Offset? _lastSamSamplePoint;
+
+  // Carries iterative-refinement context from one backend call to the next
+  // (within the same selection session, i.e. until _clearSamSelection()):
+  //   _samPrevMaskInput   - the low-res logits of whichever candidate the
+  //                         user currently has picked, sent back to SAM as
+  //                         a hint so the next prediction *builds on* that
+  //                         mask instead of guessing blind from points
+  //                         alone again. This is the standard SAM
+  //                         click-to-refine pattern.
+  //   _samPrevFullResMask - the full-res mask of that same candidate, used
+  //                         purely client-side to auto-pick whichever new
+  //                         candidate is most similar (highest IoU) after a
+  //                         refine, instead of blindly defaulting back to
+  //                         "highest score", which is what kept flipping
+  //                         the preview between e.g. "the shirt" and "the
+  //                         whole body" every time a stroke was added.
+  Uint8List? _samPrevMaskInput;
+  Uint8List? _samPrevFullResMask;
 
   List<SamMaskCandidate>? get samCandidates => _samCandidates;
   int get samCandidateIndex => _samCandidateIndex;
@@ -215,13 +242,20 @@ class EditorController extends ChangeNotifier {
     if (active == null || active.locked) return;
     _samDebounceTimer?.cancel();
     // Starting a fresh stroke while `reviewing` a previous result means the
-    // user is refining it — keep the accumulated points and candidates.
-    // Starting one from `none` means a brand new selection.
+    // user is refining it — keep the accumulated points/candidates so the
+    // backend still sees the full prompt history. Starting one from `none`
+    // means a brand new selection, so the points/candidates get cleared too.
     if (samSelectPhase == SamSelectPhase.none) {
       _samPoints.clear();
       _samCandidates = null;
-      _samStrokePreviewPoints = [];
+      _samPrevMaskInput = null;
     }
+    // The drawn brush-mark overlay, however, always resets at the start of
+    // *every* stroke — including refine passes. It's a visual cue for
+    // "what am I painting right now", not a record of the whole session
+    // (that's what _samPoints is for). Without this, marks from every past
+    // refine round stayed on screen and kept stacking on top of each other.
+    samStrokeNotifier.value = [];
     _lastSamSamplePoint = null;
     samSelectPhase = SamSelectPhase.collecting;
   }
@@ -229,10 +263,13 @@ class EditorController extends ChangeNotifier {
   /// Call with an image-space point while the user drags. Points are
   /// spatially throttled (not every pointer-move event) so a slow stroke
   /// doesn't spam hundreds of near-duplicate points into the prompt.
+  /// Deliberately does NOT call notifyListeners() — only the lightweight
+  /// stroke-preview notifier updates here, so a full canvas rebuild doesn't
+  /// happen on every single sampled point during a drag.
   void addSamBrushPoint(Offset imagePoint) {
     if (samSelectPhase != SamSelectPhase.collecting) return;
     if (_lastSamSamplePoint != null &&
-        (imagePoint - _lastSamSamplePoint!).distance < _samSampleSpacingPx) {
+        (imagePoint - _lastSamSamplePoint!).distance < samBrushSampleSpacing) {
       return;
     }
     _lastSamSamplePoint = imagePoint;
@@ -241,8 +278,7 @@ class EditorController extends ChangeNotifier {
       imagePoint.dy.round(),
       !samBrushExclude,
     ));
-    _samStrokePreviewPoints = [..._samStrokePreviewPoints, imagePoint];
-    notifyListeners();
+    samStrokeNotifier.value = [...samStrokeNotifier.value, imagePoint];
   }
 
   /// Call when the user lifts their finger. Schedules the actual backend
@@ -269,6 +305,7 @@ class EditorController extends ChangeNotifier {
     final candidates = await _sam.segmentAtPoints(
       image: active.pixels,
       points: List.of(_samPoints),
+      previousMaskInput: _samPrevMaskInput,
     );
 
     if (candidates == null || candidates.isEmpty) {
@@ -281,15 +318,55 @@ class EditorController extends ChangeNotifier {
     }
 
     _samCandidates = candidates;
-    _samCandidateIndex = 0;
+    _samCandidateIndex = _bestMatchingCandidateIndex(candidates);
+    _samPrevMaskInput = candidates[_samCandidateIndex].maskInput;
+    _samPrevFullResMask = candidates[_samCandidateIndex].mask;
     samSelectPhase = SamSelectPhase.reviewing;
     notifyListeners();
+  }
+
+  /// Picks whichever new candidate best matches the mask the user had
+  /// selected before this refine round (by IoU), falling back to the
+  /// highest-scoring candidate on the very first prediction (no prior
+  /// selection to compare against yet). Without this, every refine stroke
+  /// reset the preview to SAM's raw top-scoring guess, which on flat manga
+  /// shading is frequently "the whole figure" rather than the part being
+  /// brushed — undoing whatever the user had just corrected for.
+  int _bestMatchingCandidateIndex(List<SamMaskCandidate> candidates) {
+    final prev = _samPrevFullResMask;
+    if (prev == null) return 0;
+    var bestIdx = 0;
+    var bestIoU = -1.0;
+    for (var i = 0; i < candidates.length; i++) {
+      final iou = _maskIoU(prev, candidates[i].mask);
+      if (iou > bestIoU) {
+        bestIoU = iou;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  }
+
+  double _maskIoU(Uint8List a, Uint8List b) {
+    var intersection = 0, union = 0;
+    final len = min(a.length, b.length);
+    for (var i = 0; i < len; i++) {
+      final av = a[i] != 0, bv = b[i] != 0;
+      if (av || bv) union++;
+      if (av && bv) intersection++;
+    }
+    return union == 0 ? 0.0 : intersection / union;
   }
 
   /// Switches which of the returned candidate masks is currently previewed.
   void pickSamCandidate(int index) {
     if (_samCandidates == null || index < 0 || index >= _samCandidates!.length) return;
     _samCandidateIndex = index;
+    // If the user manually overrides the auto-picked candidate, refinement
+    // should build on *that* choice, not silently drift back to whatever
+    // was auto-picked before.
+    _samPrevMaskInput = _samCandidates![index].maskInput;
+    _samPrevFullResMask = _samCandidates![index].mask;
     notifyListeners();
   }
 
@@ -319,9 +396,11 @@ class EditorController extends ChangeNotifier {
     _samDebounceTimer?.cancel();
     _samDebounceTimer = null;
     _samPoints.clear();
-    _samStrokePreviewPoints = [];
+    samStrokeNotifier.value = [];
     _samCandidates = null;
     _samCandidateIndex = 0;
+    _samPrevMaskInput = null;
+    _samPrevFullResMask = null;
     _lastSamSamplePoint = null;
     samSelectPhase = SamSelectPhase.none;
   }
@@ -554,6 +633,7 @@ class EditorController extends ChangeNotifier {
   @override
   void dispose() {
     _samDebounceTimer?.cancel();
+    samStrokeNotifier.dispose();
     super.dispose();
   }
 }

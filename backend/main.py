@@ -142,22 +142,50 @@ def encode_png_b64(img: Image.Image) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def _top_candidates(masks: np.ndarray, scores: np.ndarray, limit: int = 3) -> list[dict]:
+def _encode_logits_b64(low_res_mask: np.ndarray) -> str:
+    """Encodes one (256, 256) float32 logit map as raw base64 bytes (no PNG
+    quantization - these are continuous scores, not an image)."""
+    return base64.b64encode(low_res_mask.astype(np.float32).tobytes()).decode()
+
+
+def _decode_logits_b64(data: str) -> np.ndarray:
+    arr = np.frombuffer(base64.b64decode(data), dtype=np.float32)
+    return arr.reshape(1, 256, 256)
+
+
+def _top_candidates(
+    masks: np.ndarray,
+    scores: np.ndarray,
+    low_res_masks: np.ndarray | None = None,
+    limit: int = 3,
+) -> list[dict]:
     """Sorts SAM's mask proposals by score (best first) and returns up to
     `limit` of them as base64 PNGs with their scores, instead of silently
     keeping only the single top-scoring one. On a flat-background manga
     panel, the "highest confidence" mask is sometimes the whole background
     or the whole figure - giving the client all 3 lets it show real
     alternatives instead of committing to a guess with no way to correct it.
+
+    Also attaches each candidate's low-res logit map (`mask_input_b64`) when
+    available. The client sends the logits of whichever candidate is
+    currently selected back on the *next* call as `mask_input`, which lets
+    SAM refine that specific mask instead of re-guessing from the
+    accumulated points alone on every debounce - the standard SAM
+    click-to-refine pattern. Without this, every refinement stroke was an
+    independent, unstable re-guess, which is what made corrections feel
+    like they were making things worse instead of converging.
     """
     order = np.argsort(scores)[::-1][:limit]
     out = []
     for idx in order:
         mask_img = Image.fromarray((masks[idx] * 255).astype(np.uint8))
-        out.append({
+        entry = {
             "mask_png_base64": encode_png_b64(mask_img),
             "score": float(scores[idx]),
-        })
+        }
+        if low_res_masks is not None:
+            entry["mask_input_b64"] = _encode_logits_b64(low_res_masks[idx])
+        out.append(entry)
     return out
 
 
@@ -185,6 +213,11 @@ class PointPrompt(BaseModel):
 class SegmentPointsRequest(BaseModel):
     image_png_base64: str
     points: list[PointPrompt]
+    # Low-res logits (base64 float32, 256x256) of whichever candidate the
+    # client currently has selected, from a previous /segment_points call
+    # in the same refinement session. Optional - omitted on the very first
+    # call of a new selection.
+    mask_input_b64: str | None = None
 
 
 class InpaintRequest(BaseModel):
@@ -247,13 +280,15 @@ def segment_points(req: SegmentPointsRequest):
 
     coords = np.array([[p.x, p.y] for p in req.points])
     labels = np.array([p.label for p in req.points])
+    mask_input = _decode_logits_b64(req.mask_input_b64) if req.mask_input_b64 else None
 
-    masks, scores, _ = predictor.predict(
+    masks, scores, low_res_masks = predictor.predict(
         point_coords=coords,
         point_labels=labels,
+        mask_input=mask_input,
         multimask_output=True,
     )
-    return {"candidates": _top_candidates(masks, scores)}
+    return {"candidates": _top_candidates(masks, scores, low_res_masks)}
 
 
 @app.post("/inpaint")

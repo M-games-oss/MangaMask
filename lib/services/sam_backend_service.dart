@@ -26,9 +26,16 @@ class SamPointPrompt {
 /// whole background or whole figure, so the caller needs a real
 /// alternative to fall back to instead of a single bad guess.
 class SamMaskCandidate {
-  SamMaskCandidate({required this.mask, required this.score});
+  SamMaskCandidate({required this.mask, required this.score, this.maskInput});
   final Uint8List mask;
   final double score;
+
+  /// Raw low-res mask logits (float32 bytes) SAM produced for this specific
+  /// candidate. Feeding this back into the next /segment_points call as
+  /// `mask_input` is what lets a refine stroke *build on* this candidate
+  /// instead of SAM re-guessing from the accumulated points alone — the
+  /// same iterative-refinement trick the official SAM demo uses.
+  final Uint8List? maskInput;
 }
 
 /// Talks to the FastAPI backend in /backend (Segment Anything / MobileSAM).
@@ -97,6 +104,7 @@ class SamBackendService {
   Future<List<SamMaskCandidate>?> segmentAtPoints({
     required img.Image image,
     required List<SamPointPrompt> points,
+    Uint8List? previousMaskInput,
   }) async {
     if (points.isEmpty) return null;
     try {
@@ -108,6 +116,8 @@ class SamBackendService {
             body: jsonEncode({
               'image_png_base64': base64Encode(pngBytes),
               'points': points.map((p) => p.toJson()).toList(),
+              if (previousMaskInput != null)
+                'mask_input_b64': base64Encode(previousMaskInput),
             }),
           )
           .timeout(const Duration(seconds: 20));
@@ -129,7 +139,12 @@ class SamBackendService {
       final score = (c['score'] as num).toDouble();
       final maskImg = img.decodePng(base64Decode(maskB64));
       if (maskImg == null) continue;
-      out.add(SamMaskCandidate(mask: _grayscaleToMask(maskImg), score: score));
+      final maskInputB64 = c['mask_input_b64'] as String?;
+      out.add(SamMaskCandidate(
+        mask: _grayscaleToMask(maskImg),
+        score: score,
+        maskInput: maskInputB64 == null ? null : base64Decode(maskInputB64),
+      ));
     }
     return out.isEmpty ? null : out;
   }

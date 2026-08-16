@@ -71,7 +71,8 @@ class ToolbarWidget extends StatelessWidget {
           ),
           if (controller.tool == ToolType.brushErase ||
               controller.tool == ToolType.restoreBrush ||
-              controller.tool == ToolType.aiRemoveBrush)
+              controller.tool == ToolType.aiRemoveBrush ||
+              controller.tool == ToolType.aiClickSelect)
             Row(
               children: [
                 const SizedBox(width: 12),
