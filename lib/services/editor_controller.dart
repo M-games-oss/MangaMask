@@ -40,6 +40,27 @@ class EditorController extends ChangeNotifier {
   String samBackendUrl = 'http://127.0.0.1:8000';
   String inpaintBackendUrl = 'http://127.0.0.1:8000';
 
+  /// Image-space position (+ null when not showing) of the brush-size
+  /// preview circle. Updated continuously while actually brushing so the
+  /// circle tracks the finger, and pulsed briefly at the canvas center when
+  /// the size slider is dragged with no stroke in progress, so you can see
+  /// how big the brush is before you commit to a stroke.
+  final ValueNotifier<Offset?> brushCursorNotifier = ValueNotifier<Offset?>(null);
+  Timer? _brushPreviewTimer;
+
+  /// Call from the toolbar's size slider (not from the canvas) — shows the
+  /// brush circle centered on the active layer for ~700ms so resizing has
+  /// visual feedback even though nothing is being painted yet.
+  void previewBrushSizeBriefly() {
+    final active = activeLayer;
+    if (active == null) return;
+    brushCursorNotifier.value = Offset(active.width / 2, active.height / 2);
+    _brushPreviewTimer?.cancel();
+    _brushPreviewTimer = Timer(const Duration(milliseconds: 700), () {
+      brushCursorNotifier.value = null;
+    });
+  }
+
   late final SamBackendService _sam = SamBackendService(baseUrl: samBackendUrl);
   late final InpaintingBackendService _inpaint =
       InpaintingBackendService(baseUrl: inpaintBackendUrl);
@@ -69,6 +90,12 @@ class EditorController extends ChangeNotifier {
     // Switching tools mid-selection would otherwise leave a dangling debounce
     // timer / stale points around from whatever the SAM brush was doing.
     if (t != ToolType.aiClickSelect) _clearSamSelection();
+    if (t != ToolType.cloneStamp) {
+      cloneSourceAnchor = null;
+      cloneSettingSource = true;
+      _cloneDragAnchor = null;
+      _cloneSourceSnapshot = null;
+    }
     tool = t;
     notifyListeners();
   }
@@ -173,7 +200,120 @@ class EditorController extends ChangeNotifier {
     notifyListeners();
   }
 
-  // ---------------- SAM brush select (tap-and-drag, debounced, reviewed) --
+  // ---------------- Fill / Eyedropper / Clone Stamp ----------------
+
+  /// Current fill color (Fill Bucket) and also what the Eyedropper writes
+  /// to when you sample a pixel — one shared "current color" like most
+  /// paint apps, so sampling with the eyedropper immediately feeds Fill.
+  Color fillColor = const Color(0xFFFFFFFF);
+
+  /// Flood-fills the contiguous region touching (x, y) with [fillColor],
+  /// same region-detection as Smart Select but recolors in place instead
+  /// of cutting a new layer.
+  void fillAt(int x, int y) {
+    final active = activeLayer;
+    if (active == null || active.locked) return;
+    final mask = FloodFillService.selectContiguous(
+      image: active.pixels,
+      startX: x,
+      startY: y,
+      tolerance: floodFillTolerance,
+    );
+    if (!mask.contains(255)) return;
+
+    history.recordBeforeEdit(active.id, active.pixels);
+    final pixels = active.pixels;
+    final r = fillColor.red;
+    final g = fillColor.green;
+    final b = fillColor.blue;
+    final a = fillColor.alpha;
+    for (var i = 0; i < mask.length; i++) {
+      if (mask[i] == 0) continue;
+      final x0 = i % active.width, y0 = i ~/ active.width;
+      pixels.setPixelRgba(x0, y0, r, g, b, a);
+    }
+    active.markDirty();
+    notifyListeners();
+  }
+
+  /// Samples the active layer's color at (x, y) into [fillColor]. Returns
+  /// the sampled color (or null if the pixel is fully transparent / out of
+  /// bounds) so the UI can show quick feedback.
+  Color? pickColorAt(int x, int y) {
+    final active = activeLayer;
+    if (active == null) return null;
+    if (x < 0 || y < 0 || x >= active.width || y >= active.height) return null;
+    final p = active.pixels.getPixel(x, y);
+    if (p.a == 0) return null;
+    final picked = Color.fromARGB(p.a.toInt(), p.r.toInt(), p.g.toInt(), p.b.toInt());
+    fillColor = picked;
+    notifyListeners();
+    return picked;
+  }
+
+  /// Image-space anchor the Clone Stamp samples from. Null = no source set
+  /// yet, so the tool is in "tap to set source" mode.
+  Offset? cloneSourceAnchor;
+  Offset? _cloneDragAnchor;
+  img.Image? _cloneSourceSnapshot;
+
+  /// Whether the next tap on the canvas sets the clone source (true) or
+  /// starts painting from the existing source (false). Toggled from the
+  /// toolbar, same pattern as the SAM include/exclude toggle.
+  bool cloneSettingSource = true;
+
+  void setCloneSource(Offset imagePoint) {
+    cloneSourceAnchor = imagePoint;
+    cloneSettingSource = false;
+    notifyListeners();
+  }
+
+  void beginCloneStroke(Offset startPoint) {
+    final active = activeLayer;
+    if (active == null || active.locked || cloneSourceAnchor == null) return;
+    history.recordBeforeEdit(active.id, active.pixels);
+    _cloneDragAnchor = startPoint;
+    // Snapshot pixels before the stroke so painting doesn't sample pixels
+    // this same stroke already overwrote a moment ago — without this, a
+    // stroke that crosses its own source region smears instead of cloning.
+    _cloneSourceSnapshot = img.Image.from(active.pixels);
+  }
+
+  void cloneStampAt(Offset imagePoint) {
+    final active = activeLayer;
+    final anchor = cloneSourceAnchor;
+    final dragAnchor = _cloneDragAnchor;
+    final source = _cloneSourceSnapshot;
+    if (active == null || active.locked || anchor == null || dragAnchor == null || source == null) return;
+
+    final srcCenter = anchor + (imagePoint - dragAnchor);
+    final r = brushSize / 2;
+    final rSq = r * r;
+    final w = active.width, h = active.height;
+    final pixels = active.pixels;
+    final cx = imagePoint.dx.round(), cy = imagePoint.dy.round();
+    final scx = srcCenter.dx.round(), scy = srcCenter.dy.round();
+
+    for (var dy = -r.ceil(); dy <= r.ceil(); dy++) {
+      final yy = cy + dy, syy = scy + dy;
+      if (yy < 0 || yy >= h || syy < 0 || syy >= h) continue;
+      for (var dx = -r.ceil(); dx <= r.ceil(); dx++) {
+        final xx = cx + dx, sxx = scx + dx;
+        if (xx < 0 || xx >= w || sxx < 0 || sxx >= w) continue;
+        if (dx * dx + dy * dy > rSq) continue;
+        final sp = source.getPixel(sxx, syy);
+        if (sp.a == 0) continue; // nothing sampled at the source, leave dest alone
+        pixels.setPixelRgba(xx, yy, sp.r, sp.g, sp.b, sp.a);
+      }
+    }
+    active.markDirty();
+    notifyListeners();
+  }
+
+  void endCloneStroke() {
+    _cloneDragAnchor = null;
+    _cloneSourceSnapshot = null;
+  }
   //
   // Replaces the old "tap once, take SAM's top-scoring mask, cut it
   // immediately" flow. That flow had two real problems: (1) a single point
@@ -440,6 +580,7 @@ class EditorController extends ChangeNotifier {
   void brushAt(Offset imagePoint) {
     final active = activeLayer;
     if (active == null || active.locked) return;
+    brushCursorNotifier.value = imagePoint;
     final r = brushSize / 2;
     final cx = imagePoint.dx.round();
     final cy = imagePoint.dy.round();
@@ -487,6 +628,7 @@ class EditorController extends ChangeNotifier {
   Future<void> previewAiRemoveStroke() async {
     final active = activeLayer;
     final mask = _strokeMask;
+    brushCursorNotifier.value = null;
     if (active == null || mask == null) {
       _strokeMask = null;
       return;
@@ -553,6 +695,7 @@ class EditorController extends ChangeNotifier {
 
   void endStroke() {
     _strokeMask = null;
+    brushCursorNotifier.value = null;
   }
 
   // ---------------- Edge map (for magnetic lasso / overlay) ----------------
@@ -633,7 +776,9 @@ class EditorController extends ChangeNotifier {
   @override
   void dispose() {
     _samDebounceTimer?.cancel();
+    _brushPreviewTimer?.cancel();
     samStrokeNotifier.dispose();
+    brushCursorNotifier.dispose();
     super.dispose();
   }
 }

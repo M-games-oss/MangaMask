@@ -27,10 +27,42 @@ class _LayerCanvasState extends State<LayerCanvas> {
   // event, which is what produced gappy/spotty strokes on fast drags.
   Offset? _lastBrushImagePoint;
 
-  Offset _toImageSpace(Offset localPos, double displayWidth, double displayHeight, int imgW, int imgH) {
+  // Number of pointers (fingers) currently down on the canvas. Tracked so a
+  // second finger touching mid-stroke can hand control over to
+  // InteractiveViewer for pan/zoom instead of continuing to paint with
+  // whatever tool is active — see the Listener wrapping InteractiveViewer
+  // below. Without this, only the dedicated Pan tool could pan/zoom; now
+  // two-finger pan/zoom works no matter which tool is selected, the same
+  // way it does in most drawing apps.
+  int _activePointers = 0;
+
+  // Screen-space position of the finger currently dragging, used purely to
+  // decide whether the SAM review controls (Cancel/Refine/Apply) should
+  // duck out of the way — see _SamReviewControls's proximity check.
+  Offset? _dragGlobalPosition;
+  final GlobalKey _reviewControlsKey = GlobalKey();
+
+  /// Converts a display-space (on-screen) point into the active layer's own
+  /// pixel space. Must subtract [layerOffset] because the compositor draws
+  /// each layer shifted by its offset (see _CompositePainter's dstRect) —
+  /// without correcting for that here, any tool used on a layer that has
+  /// been repositioned with Move Layer (which is exactly what freshly-cut
+  /// pieces get, since that's the point of Move Layer) would read/write the
+  /// wrong pixels: taps and brush strokes would land offset from wherever
+  /// the user is actually touching, including the Restore Brush, which is
+  /// why "restore doesn't work on cut layers" once they'd been nudged into
+  /// place.
+  Offset _toImageSpace(
+    Offset localPos,
+    double displayWidth,
+    double displayHeight,
+    int imgW,
+    int imgH,
+    Offset layerOffset,
+  ) {
     final sx = imgW / displayWidth;
     final sy = imgH / displayHeight;
-    return Offset(localPos.dx * sx, localPos.dy * sy);
+    return Offset(localPos.dx * sx - layerOffset.dx, localPos.dy * sy - layerOffset.dy);
   }
 
   /// Converts a 0/255 mask into a translucent orange RGBA image so it can be
@@ -103,75 +135,119 @@ class _LayerCanvasState extends State<LayerCanvas> {
         child: Stack(
           alignment: Alignment.bottomCenter,
           children: [
-            InteractiveViewer(
-              transformationController: _transform,
-              maxScale: 8,
-              minScale: 0.5,
-              panEnabled: controller.tool == ToolType.pan,
-              scaleEnabled: true,
-              child: GestureDetector(
-                onTapUp: (details) => _handleTap(context, controller, details, displayW, displayH),
-                onPanStart: dragHandled
-                    ? (details) => _handlePanStart(controller, details, displayW, displayH)
-                    : null,
-                onPanUpdate: dragHandled
-                    ? (details) => _handlePanUpdate(controller, details, displayW, displayH)
-                    : null,
-                onPanEnd: dragHandled ? (details) => _handlePanEnd(context, controller) : null,
-                child: SizedBox(
-                  width: displayW,
-                  height: displayH,
-                  child: Stack(
-                    children: [
-                      FutureBuilder<List<ui.Image>>(
-                        future: Future.wait(controller.layers.map((l) => l.uiImage())),
-                        builder: (context, snapshot) {
-                          if (!snapshot.hasData) {
-                            return const Center(child: CircularProgressIndicator());
-                          }
-                          return FutureBuilder<ui.Image?>(
-                            future: overlayMask == null
-                                ? Future.value(null)
-                                : _maskToHighlightImage(overlayMask, active.width, active.height),
-                            builder: (context, overlaySnapshot) {
-                              return CustomPaint(
-                                painter: _CompositePainter(
-                                  images: snapshot.data!,
-                                  layers: controller.layers,
-                                  lassoPoints: _lassoPoints,
-                                  highlightOverlay: overlaySnapshot.data,
-                                ),
-                                size: Size(displayW, displayH),
-                              );
-                            },
-                          );
-                        },
-                      ),
-                      // Live SAM-brush stroke preview lives in its own tiny
-                      // repaint layer, driven by a ValueNotifier instead of
-                      // controller.notifyListeners(). This is what stops
-                      // brushing from re-triggering the FutureBuilder chain
-                      // above (and the full layer image lookup it does) on
-                      // every single sampled point.
-                      if (controller.tool == ToolType.aiClickSelect)
+            Listener(
+              // Counts fingers down on the canvas so a second finger can
+              // hand off to InteractiveViewer's pan/zoom no matter which
+              // tool is active, instead of that only working with the Pan
+              // tool selected. onPointerDown/Up/Cancel fire before the
+              // gesture arena below resolves who "wins" the touch, so
+              // panEnabled is already correct by the time it matters.
+              // Also tracks raw finger position (not routed through our own
+              // GestureDetector, since Pan-tool drags and two-finger
+              // pan/zoom never reach that) purely so the SAM review panel
+              // can duck out from under a finger that's holding/dragging
+              // near it — see _ProximityFade.
+              onPointerDown: (_) => setState(() => _activePointers++),
+              onPointerMove: (e) => setState(() => _dragGlobalPosition = e.position),
+              onPointerUp: (_) => setState(() {
+                _activePointers = max(0, _activePointers - 1);
+                _dragGlobalPosition = null;
+              }),
+              onPointerCancel: (_) => setState(() {
+                _activePointers = max(0, _activePointers - 1);
+                _dragGlobalPosition = null;
+              }),
+              child: InteractiveViewer(
+                transformationController: _transform,
+                maxScale: 8,
+                minScale: 0.5,
+                panEnabled: controller.tool == ToolType.pan || _activePointers > 1,
+                scaleEnabled: true,
+                child: GestureDetector(
+                  onTapUp: (details) => _handleTap(context, controller, details, displayW, displayH),
+                  onPanStart: dragHandled
+                      ? (details) => _handlePanStart(controller, details, displayW, displayH)
+                      : null,
+                  onPanUpdate: dragHandled
+                      ? (details) => _handlePanUpdate(controller, details, displayW, displayH)
+                      : null,
+                  onPanEnd: dragHandled ? (details) => _handlePanEnd(context, controller) : null,
+                  child: SizedBox(
+                    width: displayW,
+                    height: displayH,
+                    child: Stack(
+                      children: [
+                        FutureBuilder<List<ui.Image>>(
+                          future: Future.wait(controller.layers.map((l) => l.uiImage())),
+                          builder: (context, snapshot) {
+                            if (!snapshot.hasData) {
+                              return const Center(child: CircularProgressIndicator());
+                            }
+                            return FutureBuilder<ui.Image?>(
+                              future: overlayMask == null
+                                  ? Future.value(null)
+                                  : _maskToHighlightImage(overlayMask, active.width, active.height),
+                              builder: (context, overlaySnapshot) {
+                                return CustomPaint(
+                                  painter: _CompositePainter(
+                                    images: snapshot.data!,
+                                    layers: controller.layers,
+                                    lassoPoints: _lassoPoints,
+                                    highlightOverlay: overlaySnapshot.data,
+                                  ),
+                                  size: Size(displayW, displayH),
+                                );
+                              },
+                            );
+                          },
+                        ),
+                        // Live SAM-brush stroke preview lives in its own tiny
+                        // repaint layer, driven by a ValueNotifier instead of
+                        // controller.notifyListeners(). This is what stops
+                        // brushing from re-triggering the FutureBuilder chain
+                        // above (and the full layer image lookup it does) on
+                        // every single sampled point.
+                        if (controller.tool == ToolType.aiClickSelect)
+                          IgnorePointer(
+                            child: ValueListenableBuilder<List<Offset>>(
+                              valueListenable: controller.samStrokeNotifier,
+                              builder: (context, points, _) {
+                                return CustomPaint(
+                                  painter: _SamStrokePainter(
+                                    points: points,
+                                    imageSize: Size(active.width.toDouble(), active.height.toDouble()),
+                                    displaySize: Size(displayW, displayH),
+                                    strokeWidthImagePx: controller.brushSize,
+                                    exclude: controller.samBrushExclude,
+                                  ),
+                                  size: Size(displayW, displayH),
+                                );
+                              },
+                            ),
+                          ),
+                        // Brush/eraser/restore/clone size preview: a hollow
+                        // circle that tracks the finger while painting, and
+                        // pulses at the canvas center for a moment when the
+                        // size slider is dragged (see previewBrushSizeBriefly).
                         IgnorePointer(
-                          child: ValueListenableBuilder<List<Offset>>(
-                            valueListenable: controller.samStrokeNotifier,
-                            builder: (context, points, _) {
+                          child: ValueListenableBuilder<Offset?>(
+                            valueListenable: controller.brushCursorNotifier,
+                            builder: (context, point, _) {
+                              if (point == null) return const SizedBox.shrink();
                               return CustomPaint(
-                                painter: _SamStrokePainter(
-                                  points: points,
+                                painter: _BrushCursorPainter(
+                                  point: point,
                                   imageSize: Size(active.width.toDouble(), active.height.toDouble()),
                                   displaySize: Size(displayW, displayH),
-                                  strokeWidthImagePx: controller.brushSize,
-                                  exclude: controller.samBrushExclude,
+                                  diameterImagePx: controller.brushSize,
                                 ),
                                 size: Size(displayW, displayH),
                               );
                             },
                           ),
                         ),
-                    ],
+                      ],
+                    ),
                   ),
                 ),
               ),
@@ -215,7 +291,16 @@ class _LayerCanvasState extends State<LayerCanvas> {
                 ),
               ),
             if (controller.samSelectPhase == SamSelectPhase.reviewing)
-              _SamReviewControls(controller: controller, busy: _busy, onApply: () => _applySamSelection(context, controller)),
+              _ProximityFade(
+                targetKey: _reviewControlsKey,
+                dragGlobalPosition: _dragGlobalPosition,
+                child: _SamReviewControls(
+                  key: _reviewControlsKey,
+                  controller: controller,
+                  busy: _busy,
+                  onApply: () => _applySamSelection(context, controller),
+                ),
+              ),
           ],
         ),
       );
@@ -231,7 +316,7 @@ class _LayerCanvasState extends State<LayerCanvas> {
   ) async {
     final active = controller.activeLayer;
     if (active == null) return;
-    final pt = _toImageSpace(details.localPosition, displayW, displayH, active.width, active.height);
+    final pt = _toImageSpace(details.localPosition, displayW, displayH, active.width, active.height, active.offset);
     final x = pt.dx.round().clamp(0, active.width - 1).toInt();
     final y = pt.dy.round().clamp(0, active.height - 1).toInt();
 
@@ -241,6 +326,17 @@ class _LayerCanvasState extends State<LayerCanvas> {
       await controller.smartSelectAndCut(x, y, partName: name);
     } else if (controller.tool == ToolType.polygonLasso) {
       setState(() => _lassoPoints = [..._lassoPoints, pt]);
+    } else if (controller.tool == ToolType.fillBucket) {
+      controller.fillAt(x, y);
+    } else if (controller.tool == ToolType.eyedropper) {
+      final picked = controller.pickColorAt(x, y);
+      if (picked == null && context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Nothing to sample there (transparent)')),
+        );
+      }
+    } else if (controller.tool == ToolType.cloneStamp && controller.cloneSettingSource) {
+      controller.setCloneSource(pt);
     }
     // aiClickSelect no longer reacts to a plain tap — it's a drag/brush tool
     // now (see _handlePanStart/_handlePanUpdate/_handlePanEnd), because a
@@ -274,21 +370,26 @@ class _LayerCanvasState extends State<LayerCanvas> {
   void _handlePanStart(EditorController controller, DragStartDetails details, double displayW, double displayH) {
     final active = controller.activeLayer;
     if (active == null) return;
+    if (_activePointers > 1) return; // second finger down — let it pan/zoom instead
 
     if (controller.tool == ToolType.brushErase ||
         controller.tool == ToolType.restoreBrush ||
         controller.tool == ToolType.aiRemoveBrush) {
       controller.beginStroke();
-      final pt = _toImageSpace(details.localPosition, displayW, displayH, active.width, active.height);
+      final pt = _toImageSpace(details.localPosition, displayW, displayH, active.width, active.height, active.offset);
       controller.brushAt(pt);
       _lastBrushImagePoint = pt;
     } else if (controller.tool == ToolType.aiClickSelect) {
       controller.beginSamBrushStroke();
-      final pt = _toImageSpace(details.localPosition, displayW, displayH, active.width, active.height);
+      final pt = _toImageSpace(details.localPosition, displayW, displayH, active.width, active.height, active.offset);
       controller.addSamBrushPoint(pt);
     } else if (controller.tool == ToolType.magneticLasso) {
       _lassoPoints = [details.localPosition];
       _snappedImagePoints.clear();
+    } else if (controller.tool == ToolType.cloneStamp && !controller.cloneSettingSource) {
+      final pt = _toImageSpace(details.localPosition, displayW, displayH, active.width, active.height, active.offset);
+      controller.beginCloneStroke(pt);
+      controller.cloneStampAt(pt);
     }
   }
 
@@ -296,23 +397,27 @@ class _LayerCanvasState extends State<LayerCanvas> {
       EditorController controller, DragUpdateDetails details, double displayW, double displayH) async {
     final active = controller.activeLayer;
     if (active == null) return;
+    if (_activePointers > 1) return; // second finger down — bail out of drawing
 
     if (controller.tool == ToolType.brushErase ||
         controller.tool == ToolType.restoreBrush ||
         controller.tool == ToolType.aiRemoveBrush) {
-      final pt = _toImageSpace(details.localPosition, displayW, displayH, active.width, active.height);
+      final pt = _toImageSpace(details.localPosition, displayW, displayH, active.width, active.height, active.offset);
       _strokeBrushTo(controller, pt);
     } else if (controller.tool == ToolType.aiClickSelect) {
-      final pt = _toImageSpace(details.localPosition, displayW, displayH, active.width, active.height);
+      final pt = _toImageSpace(details.localPosition, displayW, displayH, active.width, active.height, active.offset);
       controller.addSamBrushPoint(pt);
     } else if (controller.tool == ToolType.magneticLasso) {
       final edgeMap = await controller.edgeMapForActiveLayer();
-      final pt = _toImageSpace(details.localPosition, displayW, displayH, active.width, active.height);
+      final pt = _toImageSpace(details.localPosition, displayW, displayH, active.width, active.height, active.offset);
       final snapped = EdgeDetectionService.snapToEdge(
         edgeMap, active.width, active.height, Point(pt.dx.round(), pt.dy.round()));
       setState(() => _lassoPoints = [..._lassoPoints, details.localPosition]);
       // store the snapped image-space point for the final cut in _handlePanEnd
       _snappedImagePoints.add(Offset(snapped.x.toDouble(), snapped.y.toDouble()));
+    } else if (controller.tool == ToolType.cloneStamp && !controller.cloneSettingSource) {
+      final pt = _toImageSpace(details.localPosition, displayW, displayH, active.width, active.height, active.offset);
+      controller.cloneStampAt(pt);
     }
   }
 
@@ -353,6 +458,8 @@ class _LayerCanvasState extends State<LayerCanvas> {
       controller.endStroke();
     } else if (controller.tool == ToolType.aiClickSelect) {
       controller.endSamBrushStrokeAndScheduleFetch();
+    } else if (controller.tool == ToolType.cloneStamp) {
+      controller.endCloneStroke();
     } else if (controller.tool == ToolType.magneticLasso && _snappedImagePoints.length > 2) {
       final mask = _polygonToMask(_snappedImagePoints, active.width, active.height);
       controller.manualMaskAndCut(mask, 'Lasso Cut');
@@ -413,8 +520,98 @@ class _LayerCanvasState extends State<LayerCanvas> {
 /// Floating controls shown once a SAM brush selection has a candidate mask
 /// to review: pick between alternatives (if more than one came back), keep
 /// refining with more strokes, cancel, or apply (which prompts for a name).
+/// Fades and disables-hit-testing on [child] while a finger is
+/// holding/dragging within [proximityRadius] of its on-screen bounds, then
+/// restores it once the finger lifts. Deliberately keyed off
+/// [dragGlobalPosition] (only non-null while a pointer is actually down and
+/// moving) rather than any tap — a quick tap on one of the buttons should
+/// never make them vanish out from under the tap.
+class _ProximityFade extends StatelessWidget {
+  const _ProximityFade({
+    required this.targetKey,
+    required this.dragGlobalPosition,
+    required this.child,
+  });
+
+  final GlobalKey targetKey;
+  final Offset? dragGlobalPosition;
+  final Widget child;
+  static const double proximityRadius = 90;
+
+  bool get _shouldHide {
+    final pos = dragGlobalPosition;
+    if (pos == null) return false;
+    final box = targetKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize) return false;
+    final topLeft = box.localToGlobal(Offset.zero);
+    final rect = topLeft & box.size;
+    final expanded = rect.inflate(proximityRadius);
+    return expanded.contains(pos);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final hide = _shouldHide;
+    return IgnorePointer(
+      ignoring: hide,
+      child: AnimatedOpacity(
+        opacity: hide ? 0.0 : 1.0,
+        duration: const Duration(milliseconds: 150),
+        child: child,
+      ),
+    );
+  }
+}
+
+/// Hollow circle showing the current brush/eraser/restore/clone diameter,
+/// either following the finger mid-stroke or pulsing at the canvas center
+/// when the size slider is adjusted (see EditorController.brushCursorNotifier
+/// and previewBrushSizeBriefly).
+class _BrushCursorPainter extends CustomPainter {
+  _BrushCursorPainter({
+    required this.point,
+    required this.imageSize,
+    required this.displaySize,
+    required this.diameterImagePx,
+  });
+  final Offset point; // image-space
+  final Size imageSize;
+  final Size displaySize;
+  final double diameterImagePx;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (imageSize.width <= 0 || imageSize.height <= 0) return;
+    final sx = displaySize.width / imageSize.width;
+    final sy = displaySize.height / imageSize.height;
+    final center = Offset(point.dx * sx, point.dy * sy);
+    final radius = diameterImagePx * sx / 2;
+
+    canvas.drawCircle(
+      center,
+      radius,
+      Paint()
+        ..color = Colors.white
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2,
+    );
+    canvas.drawCircle(
+      center,
+      radius,
+      Paint()
+        ..color = Colors.black54
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _BrushCursorPainter oldDelegate) =>
+      oldDelegate.point != point || oldDelegate.diameterImagePx != diameterImagePx;
+}
+
 class _SamReviewControls extends StatelessWidget {
-  const _SamReviewControls({required this.controller, required this.busy, required this.onApply});
+  const _SamReviewControls({super.key, required this.controller, required this.busy, required this.onApply});
   final EditorController controller;
   final bool busy;
   final VoidCallback onApply;

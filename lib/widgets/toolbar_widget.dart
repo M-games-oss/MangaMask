@@ -55,6 +55,9 @@ class ToolbarWidget extends StatelessWidget {
                 toolButton(ToolType.restoreBrush, Icons.history_edu),
                 toolButton(ToolType.aiRemoveBrush, Icons.auto_awesome),
                 toolButton(ToolType.moveLayer, Icons.open_with),
+                toolButton(ToolType.fillBucket, Icons.format_color_fill),
+                toolButton(ToolType.eyedropper, Icons.colorize),
+                toolButton(ToolType.cloneStamp, Icons.copy_all_outlined),
                 const VerticalDivider(color: Colors.white24),
                 IconButton(
                   tooltip: 'Undo',
@@ -72,7 +75,8 @@ class ToolbarWidget extends StatelessWidget {
           if (controller.tool == ToolType.brushErase ||
               controller.tool == ToolType.restoreBrush ||
               controller.tool == ToolType.aiRemoveBrush ||
-              controller.tool == ToolType.aiClickSelect)
+              controller.tool == ToolType.aiClickSelect ||
+              controller.tool == ToolType.cloneStamp)
             Row(
               children: [
                 const SizedBox(width: 12),
@@ -85,6 +89,7 @@ class ToolbarWidget extends StatelessWidget {
                     activeColor: Colors.cyanAccent,
                     onChanged: (v) {
                       controller.brushSize = v;
+                      controller.previewBrushSizeBriefly();
                       controller.notifyListeners();
                     },
                   ),
@@ -145,8 +150,121 @@ class ToolbarWidget extends StatelessWidget {
                 ],
               ),
             ),
+          if (controller.tool == ToolType.fillBucket || controller.tool == ToolType.eyedropper)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+              child: Row(
+                children: [
+                  const Text('Color', style: TextStyle(color: Colors.white70, fontSize: 12)),
+                  const SizedBox(width: 12),
+                  GestureDetector(
+                    onTap: () => _pickFillColor(context, controller),
+                    child: Container(
+                      width: 28,
+                      height: 28,
+                      decoration: BoxDecoration(
+                        color: controller.fillColor,
+                        shape: BoxShape.circle,
+                        border: Border.all(color: Colors.white38, width: 1.5),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  if (controller.tool == ToolType.eyedropper)
+                    const Expanded(
+                      child: Text(
+                        'Tap the canvas to sample a color',
+                        style: TextStyle(color: Colors.white54, fontSize: 12),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          if (controller.tool == ToolType.cloneStamp)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+              child: Row(
+                children: [
+                  Icon(
+                    controller.cloneSourceAnchor == null ? Icons.location_searching : Icons.check_circle_outline,
+                    color: controller.cloneSourceAnchor == null ? Colors.orangeAccent : Colors.cyanAccent,
+                    size: 16,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      controller.cloneSourceAnchor == null
+                          ? 'Tap a spot with matching texture to set the source'
+                          : 'Drag to paint with the sampled texture',
+                      style: const TextStyle(color: Colors.white70, fontSize: 12),
+                    ),
+                  ),
+                  TextButton.icon(
+                    onPressed: () {
+                      controller.cloneSourceAnchor = null;
+                      controller.cloneSettingSource = true;
+                      controller.notifyListeners();
+                    },
+                    icon: const Icon(Icons.my_location, size: 16),
+                    label: const Text('New source'),
+                  ),
+                ],
+              ),
+            ),
         ],
       ),
     );
+  }
+
+  Future<void> _pickFillColor(BuildContext context, EditorController controller) async {
+    const swatches = [
+      Colors.white,
+      Colors.black,
+      Colors.red,
+      Colors.orange,
+      Colors.yellow,
+      Colors.green,
+      Colors.cyan,
+      Colors.blue,
+      Colors.purple,
+      Colors.pink,
+      Colors.brown,
+      Colors.grey,
+    ];
+    final picked = await showDialog<Color>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Fill color'),
+        content: Wrap(
+          spacing: 10,
+          runSpacing: 10,
+          children: [
+            for (final c in swatches)
+              GestureDetector(
+                onTap: () => Navigator.pop(ctx, c),
+                child: Container(
+                  width: 36,
+                  height: 36,
+                  decoration: BoxDecoration(
+                    color: c,
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: c == controller.fillColor ? Colors.cyanAccent : Colors.white24,
+                      width: c == controller.fillColor ? 3 : 1,
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+        ],
+      ),
+    );
+    if (picked != null) {
+      controller.fillColor = picked;
+      controller.notifyListeners();
+    }
   }
 }
